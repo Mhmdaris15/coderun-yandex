@@ -99,6 +99,23 @@ func TestParseProblemKeepsUnknownSections(t *testing.T) {
 	}
 }
 
+func TestParseProblemDoesNotDuplicateExamplesIntoSections(t *testing.T) {
+	// The examples block has its own <h2>Примеры</h2>. Left unignored, that
+	// heading falls into the unrecognised-section branch and the whole block
+	// is collected as run-together text, duplicating Problem.Examples inside
+	// a field meant for genuine unrecognised prose.
+	p := loadProblem(t)
+
+	if _, ok := p.Sections["примеры"]; ok {
+		t.Error("Sections contains the examples block; it belongs only in Problem.Examples")
+	}
+	for key, body := range p.Sections {
+		if strings.Contains(body, "Ввод") && strings.Contains(body, "Вывод") {
+			t.Errorf("Sections[%q] carries example data: %.80q", key, body)
+		}
+	}
+}
+
 func TestParseProblemCompilers(t *testing.T) {
 	p := loadProblem(t)
 
