@@ -6,7 +6,14 @@
 
 **Architecture:** Browser-primary. A single Playwright persistent browser context is the only thing that talks to CodeRun. HTML is pulled from the page and handed to a pure `extract` package (no Playwright types in its signatures), which makes every parser testable offline against real captured fixtures. Verdict JSON is read through the browser context's own `APIRequestContext`, so there is no second HTTP stack and no cookie copying. SQLite is the single source of truth; files under `solutions/` are write-only artifacts for humans.
 
-**Tech Stack:** Go 1.23+, `playwright-community/playwright-go`, `PuerkitoBio/goquery`, `spf13/cobra`, `modernc.org/sqlite` (pure Go, no cgo), `joho/godotenv`, stdlib `log/slog` and `testing`.
+**Tech Stack:** Go 1.23+, `mxschmitt/playwright-go`, `PuerkitoBio/goquery`, `spf13/cobra`, `modernc.org/sqlite` (pure Go, no cgo), `joho/godotenv`, stdlib `log/slog` and `testing`.
+
+> **Playwright import path.** Use `github.com/mxschmitt/playwright-go`, **not**
+> `github.com/playwright-community/playwright-go`. The project moved to the
+> `playwright-community` org, but as of v0.6201.0 the module's own `go.mod` still
+> declares `module github.com/mxschmitt/playwright-go`, so Go refuses to import it
+> under the community path. Verified against the module cache on 2026-08-14. This
+> looks like a stale dependency and is not one — do not "fix" it.
 
 **Source spec:** `docs/superpowers/specs/2026-08-14-coderun-agent-design.md`
 **Field research:** `docs/coderun-research.md`
@@ -333,11 +340,14 @@ This task therefore pulls the Playwright dependency and the Chromium download fo
 - [ ] **Step 1: Add Playwright and install Chromium**
 
 ```bash
-go get github.com/playwright-community/playwright-go
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium --with-deps
+go get github.com/mxschmitt/playwright-go
+go run github.com/mxschmitt/playwright-go/cmd/playwright@latest install chromium --with-deps
 ```
 
 The install downloads a browser build and takes a few minutes.
+
+Note the import path is `mxschmitt`, not `playwright-community` — see the Playwright
+import path note under Tech Stack. This is deliberate and verified.
 
 - [ ] **Step 2: Write the capture tool**
 
@@ -2519,11 +2529,12 @@ git commit -m "feat(storage): write immutable per-attempt solution artifacts"
 The dependency and the Chromium build were installed in Task 2. Verify rather than reinstall:
 
 ```bash
-go list -m github.com/playwright-community/playwright-go
+go list -m github.com/mxschmitt/playwright-go
 ```
 
-If it is missing, run `go get github.com/playwright-community/playwright-go` and
-`go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium --with-deps`.
+If it is missing, run `go get github.com/mxschmitt/playwright-go` and
+`go run github.com/mxschmitt/playwright-go/cmd/playwright@latest install chromium --with-deps`.
+The `mxschmitt` path is correct — see the Playwright import path note under Tech Stack.
 
 - [ ] **Step 2: Write the failing test**
 
