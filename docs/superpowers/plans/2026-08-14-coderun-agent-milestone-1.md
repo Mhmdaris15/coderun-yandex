@@ -904,8 +904,13 @@ func TestNormalizeKatexRemovesDuplication(t *testing.T) {
 func TestNormalizeKatexWithoutAnnotationDropsHiddenBranch(t *testing.T) {
 	// Defensive: if KaTeX ever renders without an annotation, we must still
 	// not emit the formula twice.
+	//
+	// The MathML branch carries real glyph text here (<mi>/<mo>), exactly as
+	// KaTeX emits it. That matters: with an empty <semantics> a no-op
+	// implementation would pass this test, making it useless as a guard.
 	html := `<div id="root"><span class="katex">` +
-		`<span class="katex-mathml"><math><semantics></semantics></math></span>` +
+		`<span class="katex-mathml"><math><semantics><mrow>` +
+		`<mi>x</mi><mo>+</mo><mi>y</mi></mrow></semantics></math></span>` +
 		`<span class="katex-html" aria-hidden="true">x+y</span></span></div>`
 
 	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(html))
@@ -913,7 +918,35 @@ func TestNormalizeKatexWithoutAnnotationDropsHiddenBranch(t *testing.T) {
 	NormalizeKatex(root)
 
 	if got := strings.TrimSpace(root.Text()); got != "x+y" {
-		t.Errorf("got %q, want %q", got, "x+y")
+		t.Errorf("got %q, want %q (a no-op implementation yields \"x+yx+y\")", got, "x+y")
+	}
+	if root.Find(".katex").Length() != 0 {
+		t.Error("a .katex node survived the no-annotation path")
+	}
+}
+
+func TestNormalizeKatexEscapesMarkupInTex(t *testing.T) {
+	// Strict inequalities are everywhere in competitive programming. The TeX
+	// source contains a literal '<', which must never be spliced into an HTML
+	// string and re-parsed as a tag.
+	//
+	// The '<' must be followed immediately by a letter, with no space. HTML5
+	// only enters tag-open state when '<' is directly followed by an ASCII
+	// letter, so "0 < x" survives an unescaped splice by luck while "0<x"
+	// does not. Only the no-space form discriminates a correct implementation
+	// from a broken one.
+	html := `<div id="root"><span class="katex">` +
+		`<span class="katex-mathml"><math><semantics>` +
+		`<annotation encoding="application/x-tex">0&lt;x&lt;10</annotation>` +
+		`</semantics></math></span>` +
+		`<span class="katex-html" aria-hidden="true">0&lt;x&lt;10</span></span></div>`
+
+	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(html))
+	root := doc.Find("#root")
+	NormalizeKatex(root)
+
+	if got := strings.TrimSpace(root.Text()); got != "$0<x<10$" {
+		t.Errorf("got %q, want %q — TeX was re-parsed as markup", got, "$0<x<10$")
 	}
 }
 
@@ -953,6 +986,7 @@ Create `internal/coderun/extract/katex.go`:
 package extract
 
 import (
+	"html"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -965,19 +999,28 @@ import (
 // once as styled HTML for sighted users — so reading text without this step
 // duplicates every formula. The TeX source is recovered from the
 // <annotation encoding="application/x-tex"> node in the MathML branch.
+//
+// Recovered text is HTML-escaped before being spliced back in. goquery's
+// Text() returns decoded text, and ReplaceWithHtml re-parses its argument as
+// markup, so an unescaped strict inequality like "0 < x < 10" would be read
+// as an opening tag and silently destroy the constraint.
 func NormalizeKatex(sel *goquery.Selection) {
 	sel.Find(".katex").Each(func(_ int, k *goquery.Selection) {
 		tex := strings.TrimSpace(k.Find(`annotation[encoding="application/x-tex"]`).First().Text())
 
 		if tex == "" {
-			// No annotation to recover. Drop the MathML branch so at least the
-			// visible rendering is not emitted twice.
+			// No annotation to recover. Drop the MathML branch and unwrap the
+			// node, so the visible rendering survives exactly once and no
+			// .katex element is left behind.
 			k.Find(".katex-mathml").Remove()
+			visible := strings.TrimSpace(k.Text())
+			k.ReplaceWithHtml("<span>" + html.EscapeString(visible) + "</span>")
 			return
 		}
 		// Collapse internal whitespace: annotations arrive pretty-printed.
+		// TeX is whitespace-insensitive in maths mode, so this is safe.
 		tex = strings.Join(strings.Fields(tex), " ")
-		k.ReplaceWithHtml("<span>$" + tex + "$</span>")
+		k.ReplaceWithHtml("<span>$" + html.EscapeString(tex) + "$</span>")
 	})
 }
 ```
@@ -985,7 +1028,12 @@ func NormalizeKatex(sel *goquery.Selection) {
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `go test ./internal/coderun/extract/ -run Katex -v`
-Expected: PASS, 4 tests
+Expected: PASS, 5 tests
+
+Before committing, confirm `TestNormalizeKatexEscapesMarkupInTex` is a real guard:
+temporarily drop the `html.EscapeString` call and re-run it. It must FAIL. Restore
+the call afterwards. A test that passes against the broken implementation is not
+coverage.
 
 - [ ] **Step 6: Commit**
 
