@@ -312,7 +312,11 @@ git commit -m "feat(config): add environment configuration with sequential-only 
 
 ## Task 2: Capture real HTML fixtures
 
-Every parser in this plan is tested against **real** captured HTML, never hand-written approximations. Because CodeRun server-renders its pages and crawling needs no authentication, a plain HTTP client is enough to capture them.
+Every parser in this plan is tested against **real** captured HTML, never hand-written approximations.
+
+Capture goes through a headless browser, not `http.Get`. This was established empirically: a plain HTTP capture returns the problem page's shell (`problem-title`, the title text) but **not** its statement body, KaTeX, or `code-snippet` examples, which are rendered after hydration. Listings happen to survive a raw fetch; statements do not. Since the agent is browser-primary anyway, the capture tool uses the same mechanism the real crawler will.
+
+This task therefore pulls the Playwright dependency and the Chromium download forward from Task 10. Crawling still needs no authentication.
 
 **Files:**
 - Create: `cmd/capture-fixtures/main.go`
@@ -326,84 +330,142 @@ Every parser in this plan is tested against **real** captured HTML, never hand-w
   - `testdata/selection-2025-summer-common.html` — a selection's problem list
   - `testdata/problem-bridge-to-the-palace.html` — a problem page
 
-- [ ] **Step 1: Write the capture tool**
+- [ ] **Step 1: Add Playwright and install Chromium**
+
+```bash
+go get github.com/playwright-community/playwright-go
+go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium --with-deps
+```
+
+The install downloads a browser build and takes a few minutes.
+
+- [ ] **Step 2: Write the capture tool**
 
 Create `cmd/capture-fixtures/main.go`:
 
 ```go
-// Command capture-fixtures downloads real CodeRun pages into the extract
+// Command capture-fixtures saves real CodeRun pages into the extract
 // package's testdata directory.
 //
-// These pages are server-rendered and public, so no browser and no
-// authentication are required. Run this deliberately when refreshing
-// fixtures; it is not part of the test suite.
+// Capture runs through a headless browser because problem statements are
+// rendered after hydration: a plain HTTP GET returns the page shell without
+// the statement body, its KaTeX, or its examples. Listings would survive a
+// raw fetch, but using one mechanism for all three keeps the fixtures
+// consistent with what the real crawler sees.
+//
+// These pages are public; no authentication is involved. Run this
+// deliberately when refreshing fixtures — it is not part of the test suite.
 package main
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/playwright-community/playwright-go"
+
 	"coderun-agent/internal/config"
 )
 
-var targets = map[string]string{
-	"selections.html":                    "/selections?group=coderun-seasons",
-	"selection-2025-summer-common.html":  "/selections/2025-summer-common",
-	"problem-bridge-to-the-palace.html":  "/selections/2025-summer-common/problems/bridge-to-the-palace",
+type target struct {
+	name string
+	path string
+	// mustContain is a substring that proves the page finished rendering.
+	// Capturing a shell without it would silently produce useless fixtures.
+	mustContain string
+}
+
+var targets = []target{
+	{"selections.html", "/selections?group=coderun-seasons", "CodeRun Boost Challenge"},
+	{"selection-2025-summer-common.html", "/selections/2025-summer-common", "problem-list-item"},
+	{"problem-bridge-to-the-palace.html", "/selections/2025-summer-common/problems/bridge-to-the-palace", "Формат ввода"},
 }
 
 func main() {
-	outDir := filepath.Join("internal", "coderun", "extract", "testdata")
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, "mkdir:", err)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
-	}
-
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	for name, path := range targets {
-		// One second between requests. We are a guest on this site.
-		time.Sleep(time.Second)
-
-		body, err := fetch(client, config.BaseURL+path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
-			os.Exit(1)
-		}
-		dest := filepath.Join(outDir, name)
-		if err := os.WriteFile(dest, body, 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "write %s: %v\n", dest, err)
-			os.Exit(1)
-		}
-		fmt.Printf("saved %s (%d bytes)\n", dest, len(body))
 	}
 }
 
-func fetch(c *http.Client, url string) ([]byte, error) {
-	resp, err := c.Get(url)
+func run() error {
+	outDir := filepath.Join("internal", "coderun", "extract", "testdata")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+
+	pw, err := playwright.Run()
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("start playwright (did you run `playwright install chromium`?): %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	defer pw.Stop()
+
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(true),
+	})
+	if err != nil {
+		return fmt.Errorf("launch chromium: %w", err)
 	}
-	return io.ReadAll(resp.Body)
+	defer browser.Close()
+
+	page, err := browser.NewPage()
+	if err != nil {
+		return fmt.Errorf("open page: %w", err)
+	}
+
+	for _, t := range targets {
+		// One second between navigations. We are a guest on this site.
+		time.Sleep(time.Second)
+
+		html, err := capture(page, t)
+		if err != nil {
+			return err
+		}
+		dest := filepath.Join(outDir, t.name)
+		if err := os.WriteFile(dest, []byte(html), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dest, err)
+		}
+		fmt.Printf("saved %s (%d bytes)\n", dest, len(html))
+	}
+	return nil
+}
+
+func capture(page playwright.Page, t target) (string, error) {
+	if _, err := page.Goto(config.BaseURL+t.path, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateNetworkidle,
+	}); err != nil {
+		return "", fmt.Errorf("navigate %s: %w", t.path, err)
+	}
+
+	// Wait for the marker that proves rendering completed, rather than
+	// trusting networkidle alone.
+	if _, err := page.WaitForFunction(
+		fmt.Sprintf("() => document.documentElement.outerHTML.includes(%q)", t.mustContain),
+		nil,
+		playwright.PageWaitForFunctionOptions{Timeout: playwright.Float(20000)},
+	); err != nil {
+		return "", fmt.Errorf("%s never rendered %q: %w", t.name, t.mustContain, err)
+	}
+
+	html, err := page.Content()
+	if err != nil {
+		return "", fmt.Errorf("read content for %s: %w", t.name, err)
+	}
+	return html, nil
 }
 ```
 
-- [ ] **Step 2: Run the capture tool**
+- [ ] **Step 3: Run the capture tool**
 
 Run: `go run ./cmd/capture-fixtures`
 Expected: three `saved …` lines, each well over 20000 bytes.
 
-- [ ] **Step 3: Write the fixture sanity test**
+If a `never rendered` error appears, the page structure changed — report it rather than removing the check.
 
-This test guards the assumption the whole `extract` package rests on: that the content really is in the server-rendered HTML rather than injected by JavaScript. If it fails, the capture tool must be switched to a browser-based capture before continuing.
+- [ ] **Step 4: Write the fixture sanity test**
+
+This test guards the assumption the whole `extract` package rests on: that the fixtures contain fully rendered content. If it fails, the fixtures are shells and every parser built on them would match nothing.
 
 Create `internal/coderun/extract/fixtures_test.go`:
 
@@ -447,12 +509,12 @@ func TestFixturesAreServerRendered(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 5: Run the test to verify it passes**
 
 Run: `go test ./internal/coderun/extract/ -v`
-Expected: PASS. If `Формат ввода` is missing, stop and re-capture through Playwright before continuing.
+Expected: PASS. If `Формат ввода` is missing, the capture did not wait long enough — fix the capture tool, never the assertion.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 Fixtures are committed deliberately: they are the record of what the site actually looked like on this date.
 
@@ -2452,12 +2514,16 @@ git commit -m "feat(storage): write immutable per-attempt solution artifacts"
   - `pwclient.ErrChallenge` sentinel error
   - `pwclient.DetectChallenge(url, html string) error` — pure, unit-tested
 
-- [ ] **Step 1: Add playwright-go**
+- [ ] **Step 1: Confirm Playwright is available**
+
+The dependency and the Chromium build were installed in Task 2. Verify rather than reinstall:
 
 ```bash
-go get github.com/playwright-community/playwright-go
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium --with-deps
+go list -m github.com/playwright-community/playwright-go
 ```
+
+If it is missing, run `go get github.com/playwright-community/playwright-go` and
+`go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium --with-deps`.
 
 - [ ] **Step 2: Write the failing test**
 

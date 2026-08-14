@@ -12,10 +12,27 @@ One real submission was made during recon (a deliberately wrong Python solution 
   `buildId` changes every deploy — never hardcode it or `/_next/data/<buildId>/` URLs.
 - CSS Modules, hashed class names (`SelectionCard_selection-card__link__m3s24`).
   Confirms PLAN.md §7: **never select on class names.** Use `data-testid`, roles, hrefs.
-- **Pages are server-rendered into HTML.** No client-side hydration is required to read
-  selections, problem lists or statements — so a plain HTTP GET + HTML parse is
-  sufficient. `pageProps.queryValues` (a dehydrated React Query cache) is empty on all
-  three page types, so there is no free structured JSON in the page.
+- **Rendering is mixed, and the split matters.** Corrected 2026-08-14 after a plain
+  `http.Get` capture of all three page types:
+
+  | Content | In server HTML? |
+  |---|---|
+  | Selection cards | **Yes** |
+  | Problem list rows (`problem-list-item`) | **Yes** |
+  | Problem title (`problem-title`) | **Yes** |
+  | Statement body, `Формат ввода`, KaTeX, `code-snippet` examples | **No — client-rendered** |
+
+  So listings can be read with a plain HTTP GET, but **problem statements cannot**:
+  the page shell arrives server-rendered and the statement is filled in after
+  hydration. Any statement extraction must read the DOM *after* JavaScript has run
+  (`page.Content()`), not the raw HTTP response body.
+
+  `pageProps.queryValues` (a dehydrated React Query cache) is empty on all three page
+  types, so there is no free structured JSON in the page either.
+
+  This was originally recorded as "everything is server-rendered", inferred from
+  reading the live DOM in a browser — which necessarily showed post-JavaScript state.
+  The distinction only surfaced when raw HTML was fetched without a browser.
 
 ## Authentication
 
