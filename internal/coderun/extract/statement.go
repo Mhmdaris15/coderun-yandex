@@ -32,8 +32,8 @@ func ParseProblem(html string, ref coderun.ProblemRef) (*coderun.Problem, error)
 		return nil, fmt.Errorf("problem-title not found: the page structure has changed")
 	}
 
-	// The description container is the title's nearest ancestor that also
-	// holds the section headings. Selecting by the hashed class is fragile.
+	// The description container is the title's nearest ancestor that also holds
+	// the section headings. Selecting by its hashed class would be fragile.
 	container := title.Parent()
 	for container.Length() > 0 && container.Find("h2").Length() == 0 {
 		container = container.Parent()
@@ -146,9 +146,19 @@ func walkForSections(node *goquery.Selection, current *string, buf *[]string, fl
 }
 
 // parseExamples reads the code-snippet blocks, which alternate Ввод / Вывод.
+//
+// Each snippet is a header element carrying the caption plus a <pre> holding
+// the data. Read the <pre> directly: taking the whole snippet's text runs the
+// caption straight into the content with no separator ("Ввод5\n2 0 -3 3 6"),
+// so there is no newline for a label-stripper to find.
 func parseExamples(doc *goquery.Document) []coderun.Example {
 	var blocks []string
 	doc.Find(`[data-testid="code-snippet"]`).Each(func(_ int, s *goquery.Selection) {
+		if pre := s.Find("pre").First(); pre.Length() > 0 {
+			blocks = append(blocks, strings.Trim(pre.Text(), "\n"))
+			return
+		}
+		// Fallback for a snippet rendered without a <pre>.
 		blocks = append(blocks, stripSnippetLabel(s.Text()))
 	})
 
@@ -171,17 +181,27 @@ func stripSnippetLabel(s string) string {
 	return strings.TrimRight(s, "\n")
 }
 
-// parseCompilers reads the language listbox. The option's id attribute IS the
-// compilerSlug — it is never derived from the visible label.
+// parseCompilers reads the language picker, which is a native <select> in the
+// server-rendered page. The option's value attribute IS the compilerSlug — it
+// is never derived from the visible label, because JavaScript's slug is
+// nodejs_20_make.
+//
+// A hidden placeholder option with an empty value is present and skipped.
+//
+// Version is left empty here. The static <select> carries only the language
+// name ("JavaScript"); the versioned label ("JavaScript 20.14.0") appears only
+// in the rich dropdown the client renders once opened, which is not worth a
+// browser interaction for a cosmetic field.
 func parseCompilers(doc *goquery.Document) []coderun.Compiler {
 	var out []coderun.Compiler
-	doc.Find(`[role="listbox"] [role="option"]`).Each(func(_ int, o *goquery.Selection) {
-		slug, ok := o.Attr("id")
+	doc.Find(`select option`).Each(func(_ int, o *goquery.Selection) {
+		slug, ok := o.Attr("value")
 		if !ok || slug == "" {
 			return
 		}
-		label := strings.Join(strings.Fields(o.Text()), " ")
+		label := normalizeSpace(o.Text())
 		title, version := label, ""
+		// Split a trailing version if the label happens to carry one.
 		if i := strings.LastIndex(label, " "); i > 0 {
 			candidate := label[i+1:]
 			if len(candidate) > 0 && candidate[0] >= '0' && candidate[0] <= '9' {

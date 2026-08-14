@@ -102,16 +102,6 @@ func TestParseProblemKeepsUnknownSections(t *testing.T) {
 func TestParseProblemCompilers(t *testing.T) {
 	p := loadProblem(t)
 
-	if len(p.Languages) == 0 {
-		// parseCompilers looks for role="listbox" > role="option" elements with
-		// an id attribute. The captured fixture instead renders compilers as a
-		// native <select><option value="...">Label</option></select> (plus a
-		// JSON payload in a script tag) — no ARIA listbox exists in the
-		// server-rendered HTML at all. Move compiler discovery to Task 12,
-		// which drives a live browser, rather than deleting this assertion.
-		t.Skip("compiler listbox not present in server-rendered fixture; see Task 12")
-	}
-
 	if len(p.Languages) < 10 {
 		t.Fatalf("got %d compilers, want at least 10", len(p.Languages))
 	}
