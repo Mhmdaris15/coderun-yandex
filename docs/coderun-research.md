@@ -282,6 +282,48 @@ Crawling (PLAN.md phases 3–5) can therefore be built and tested with zero auth
 - `bridge-to-the-palace`: number 2, difficulty `Средняя`, 2 samples, 83 hidden tests,
   `problemContextId=1838`, TL 2000 ms, ML 256 MB.
 
+## Future improvement — structured problem data in `__NEXT_DATA__`
+
+Found 2026-08-15 while reviewing the listing parsers. **Not adopted**: the DOM
+parsers were already built and tested, and the decision was taken to keep them and
+revisit this later. Recorded here so the option is not lost.
+
+`__NEXT_DATA__.props.pageProps.values` on a selection page contains a fully
+structured problem list. Verified against the committed fixture for
+`2025-summer-common`:
+
+```json
+{"id":1838,"slug":"bridge-to-the-palace","difficulty":"MEDIUM",
+ "solutionState":"NOT_SOLVED","order":2,"compilerLanguages":["python", …]}
+```
+
+plus `"total":25` and `"problemsAmount":25` at the container level.
+
+Why it is better than the DOM path currently in use:
+
+| DOM approach in use | JSON equivalent |
+|---|---|
+| Difficulty from Russian text (`Средняя`) | `"difficulty":"MEDIUM"` — canonical, locale-independent |
+| Status from the `ProblemStatus_type_<token>__` class fragment | `"solutionState":"NOT_SOLVED"` |
+| Page count from the pager's `aria-label="К странице N"` | `"total":25` — exact, no pager parsing |
+| Titles carrying U+00A0, needing whitespace normalisation | clean titles |
+| `problemContextId` discovered by intercepting the `solution-template` request | `"id":1838` — present in the page |
+
+The last row is the most valuable: `1838` is the same `problemContextId` this
+document records as discoverable only through network interception. It is in the
+HTML the whole time.
+
+**Caveat.** The payload sits under obfuscated, build-specific keys such as
+`"7kyt1swa|33cvww5a"`, so any implementation must locate it **by shape** — search
+`pageProps.values` for an object holding an array whose elements have both `slug`
+and `difficulty` — never by key name.
+
+Note for the record: an earlier pass over `pageProps.values` dismissed it as an
+i18n/experiments blob. That was wrong, and several fragilities in the DOM path
+(locale-dependent difficulty parsing, pager detection, NBSP handling, ContextID
+discovery) trace back to that misreading. `queryValues.queries` genuinely is empty;
+`values` is where the data lives.
+
 ## Still open
 
 1. Full `verdict` enum (only `WRONG_ANSWER` seen).
