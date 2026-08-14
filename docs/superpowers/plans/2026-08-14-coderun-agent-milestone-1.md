@@ -1719,6 +1719,23 @@ func TestParseProblemKeepsUnknownSections(t *testing.T) {
 	}
 }
 
+func TestParseProblemDoesNotDuplicateExamplesIntoSections(t *testing.T) {
+	// The examples block has its own <h2>Примеры</h2>. Left unignored, that
+	// heading falls into the unrecognised-section branch and the whole block
+	// is collected as run-together text, duplicating Problem.Examples inside
+	// a field meant for genuine unrecognised prose.
+	p := loadProblem(t)
+
+	if _, ok := p.Sections["примеры"]; ok {
+		t.Error("Sections contains the examples block; it belongs only in Problem.Examples")
+	}
+	for key, body := range p.Sections {
+		if strings.Contains(body, "Ввод") && strings.Contains(body, "Вывод") {
+			t.Errorf("Sections[%q] carries example data: %.80q", key, body)
+		}
+	}
+}
+
 func TestParseProblemCompilers(t *testing.T) {
 	p := loadProblem(t)
 
@@ -1776,6 +1793,20 @@ var sectionHeadings = map[string]string{
 	"ограничения":   "constraints",
 	"примечание":    "notes",
 }
+
+// ignoredHeadings name sections whose content is captured structurally
+// elsewhere. The examples block sits under its own <h2>Примеры</h2>, and its
+// body is already parsed into Problem.Examples from the code-snippet blocks.
+// Without this, that heading falls through to the unrecognised-section branch
+// and the whole examples block is slurped into Sections as run-together text
+// ("Пример 1Ввод5\n2 0 -3 3 6\nВывод2…") — a garbled duplicate inside a field
+// documented as holding genuine unrecognised prose.
+var ignoredHeadings = map[string]bool{
+	"примеры": true,
+}
+
+// ignoredSection is the sentinel section key whose buffered body is discarded.
+const ignoredSection = "\x00ignored"
 
 func ParseProblem(html string, ref coderun.ProblemRef) (*coderun.Problem, error) {
 	doc, err := parse(html)
@@ -1854,7 +1885,7 @@ func assignSections(container *goquery.Selection, p *coderun.Problem) {
 	flush := func() {
 		text := clean(strings.Join(buf, "\n"))
 		buf = buf[:0]
-		if text == "" {
+		if text == "" || current == ignoredSection {
 			return
 		}
 		switch current {
@@ -1883,10 +1914,15 @@ func walkForSections(node *goquery.Selection, current *string, buf *[]string, fl
 	if goquery.NodeName(node) == "h2" {
 		flush()
 		label := strings.ToLower(strings.TrimSpace(node.Text()))
-		if key, ok := sectionHeadings[label]; ok {
-			*current = key
-		} else {
-			*current = label // preserved verbatim in Sections
+		switch {
+		case ignoredHeadings[label]:
+			*current = ignoredSection
+		default:
+			if key, ok := sectionHeadings[label]; ok {
+				*current = key
+			} else {
+				*current = label // preserved verbatim in Sections
+			}
 		}
 		return
 	}
