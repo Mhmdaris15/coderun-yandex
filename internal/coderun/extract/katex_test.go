@@ -53,8 +53,13 @@ func TestNormalizeKatexRemovesDuplication(t *testing.T) {
 func TestNormalizeKatexWithoutAnnotationDropsHiddenBranch(t *testing.T) {
 	// Defensive: if KaTeX ever renders without an annotation, we must still
 	// not emit the formula twice.
+	//
+	// The MathML branch carries real glyph text here (<mi>/<mo>), exactly as
+	// KaTeX emits it. That matters: with an empty <semantics> a no-op
+	// implementation would pass this test, making it useless as a guard.
 	html := `<div id="root"><span class="katex">` +
-		`<span class="katex-mathml"><math><semantics></semantics></math></span>` +
+		`<span class="katex-mathml"><math><semantics><mrow>` +
+		`<mi>x</mi><mo>+</mo><mi>y</mi></mrow></semantics></math></span>` +
 		`<span class="katex-html" aria-hidden="true">x+y</span></span></div>`
 
 	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(html))
@@ -62,7 +67,29 @@ func TestNormalizeKatexWithoutAnnotationDropsHiddenBranch(t *testing.T) {
 	NormalizeKatex(root)
 
 	if got := strings.TrimSpace(root.Text()); got != "x+y" {
-		t.Errorf("got %q, want %q", got, "x+y")
+		t.Errorf("got %q, want %q (a no-op implementation yields \"x+yx+y\")", got, "x+y")
+	}
+	if root.Find(".katex").Length() != 0 {
+		t.Error("a .katex node survived the no-annotation path")
+	}
+}
+
+func TestNormalizeKatexEscapesMarkupInTex(t *testing.T) {
+	// Strict inequalities are everywhere in competitive programming. The TeX
+	// source contains a literal '<', which must never be spliced into an HTML
+	// string and re-parsed as a tag.
+	html := `<div id="root"><span class="katex">` +
+		`<span class="katex-mathml"><math><semantics>` +
+		`<annotation encoding="application/x-tex">0 &lt; x &lt; 10</annotation>` +
+		`</semantics></math></span>` +
+		`<span class="katex-html" aria-hidden="true">0 &lt; x &lt; 10</span></span></div>`
+
+	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(html))
+	root := doc.Find("#root")
+	NormalizeKatex(root)
+
+	if got := strings.TrimSpace(root.Text()); got != "$0 < x < 10$" {
+		t.Errorf("got %q, want %q — TeX was re-parsed as markup", got, "$0 < x < 10$")
 	}
 }
 
