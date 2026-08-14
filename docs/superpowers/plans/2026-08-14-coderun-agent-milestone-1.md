@@ -1314,6 +1314,42 @@ func TestParseProblemList(t *testing.T) {
 	}
 }
 
+func TestParseProblemListReadsDifficulty(t *testing.T) {
+	// Without this, a stub returning DifficultyUnknown for every row passes
+	// the whole suite. Difficulty is derived by slicing row text after the
+	// title, which is the most fragile extraction in this file.
+	probs, _, err := ParseProblemList(
+		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range probs {
+		if p.Difficulty.Raw == "" {
+			t.Errorf("problem %q has an empty difficulty label — rowDifficulty is not finding it",
+				p.Ref.ProblemSlug)
+		}
+	}
+	if probs[0].Difficulty.Level == coderun.DifficultyUnknown {
+		t.Errorf("problem %q difficulty %q did not map to a known level",
+			probs[0].Ref.ProblemSlug, probs[0].Difficulty.Raw)
+	}
+}
+
+func TestCountPagesWithoutPagerIsOne(t *testing.T) {
+	// A selection short enough to fit on one page has no pager at all. That
+	// must read as exactly one page, not zero.
+	_, pages, err := ParseProblemList(
+		`<div data-testid="problem-list-item">`+
+			`<span role="graphics-symbol" class="ProblemStatus_type_solved__x"></span>`+
+			`<a href="/selections/s/problems/only-one">1. Единственная Средняя</a></div>`, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages != 1 {
+		t.Errorf("pages = %d, want 1 when no pager is present", pages)
+	}
+}
+
 func TestParseProblemListStripsFiltersFromSlug(t *testing.T) {
 	probs, _, err := ParseProblemList(
 		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
@@ -1475,13 +1511,28 @@ func rowDifficulty(row *goquery.Selection, title string) string {
 	return ""
 }
 
-// countPages reads the highest numeric label in the pager. A single-page list
-// has no pager, which correctly yields 1.
+// pageLinkLabel matches the pager's per-page control, whose accessible name is
+// "К странице <n>". Matching the ARIA label rather than "any number inside any
+// <nav>" avoids picking up breadcrumbs or unrelated navigation — the page
+// carries both a Breadcrumbs nav and a Pagination nav.
+//
+// This is locale-dependent, which is a real weakness. It is accepted because
+// the alternative is a structural guess that fails silently: an
+// under-counted pager means whole pages of problems are never crawled and no
+// error is raised. ListProblems carries a second guard for that case.
+var pageLinkLabel = regexp.MustCompile(`^К странице (\d+)$`)
+
+// countPages reads the highest page number offered by the pager. A single-page
+// list has no pager, which correctly yields 1.
 func countPages(doc *goquery.Document) int {
 	max := 1
-	doc.Find(`nav a, nav button`).Each(func(_ int, e *goquery.Selection) {
-		n, err := strconv.Atoi(strings.TrimSpace(e.Text()))
-		if err == nil && n > max {
+	doc.Find(`[aria-label]`).Each(func(_ int, e *goquery.Selection) {
+		label, _ := e.Attr("aria-label")
+		m := pageLinkLabel.FindStringSubmatch(strings.TrimSpace(label))
+		if m == nil {
+			return
+		}
+		if n, err := strconv.Atoi(m[1]); err == nil && n > max {
 			max = n
 		}
 	})
@@ -3143,6 +3194,16 @@ func (b *Browser) ListProblems(ctx context.Context, selectionSlug string) ([]cod
 		if page == 1 {
 			totalPages = pages
 			slog.Info("problem list", "selection", selectionSlug, "pages", totalPages)
+
+			// Guard against a silently missed pager. Page size is 20, so a
+			// "single page" holding exactly 20 problems is far more likely to
+			// be an undetected page 1 of N than a selection that happens to
+			// end on the boundary. Under-crawling produces no error of its
+			// own — whole pages simply never appear — so say so loudly.
+			if totalPages == 1 && len(probs) >= extract.DefaultFilters(1).PageSize {
+				slog.Warn("selection reports one page but is exactly full; the pager may not have been detected",
+					"selection", selectionSlug, "problems", len(probs))
+			}
 		}
 
 		added := 0
