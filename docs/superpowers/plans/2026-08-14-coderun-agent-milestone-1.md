@@ -2831,6 +2831,7 @@ Wires the browser to the pure parsers, adds pagination, and captures `ContextID`
 **Files:**
 - Create: `internal/coderun/playwright/crawl.go`, `internal/coderun/client.go`
 - Test: `internal/coderun/playwright/crawl_test.go`
+- Imports: `crawl.go` needs `coderun-agent/internal/config` (for `config.BaseURL`), `coderun-agent/internal/coderun`, `coderun-agent/internal/coderun/extract`, `github.com/playwright-community/playwright-go`, plus `context`, `encoding/json`, `fmt`, `log/slog`, `net/url`, `strconv`, `sync`
 
 **Interfaces:**
 - Consumes: `Browser.Goto` (Task 10), all `extract` parsers (Tasks 3–7)
@@ -3118,7 +3119,7 @@ func (b *Browser) apiGet(ctx context.Context, path string) ([]byte, error) {
 	default:
 	}
 
-	resp, err := b.Ctx.Request().Get(configBaseURL() + path)
+	resp, err := b.Ctx.Request().Get(config.BaseURL + path)
 	if err != nil {
 		return nil, fmt.Errorf("api GET %s: %w", path, err)
 	}
@@ -3131,16 +3132,7 @@ func (b *Browser) apiGet(ctx context.Context, path string) ([]byte, error) {
 }
 ```
 
-Add `internal/coderun/playwright/base.go`:
-
-```go
-package pwclient
-
-import "coderun-agent/internal/config"
-
-// configBaseURL keeps the origin in exactly one place.
-func configBaseURL() string { return config.BaseURL }
-```
+Note the import list for `crawl.go` must include `coderun-agent/internal/config` for the `config.BaseURL` reference in `apiGet`.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
@@ -3157,7 +3149,7 @@ If `b.Ctx.Request()` does not exist in the installed playwright-go version, chec
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/coderun/client.go internal/coderun/playwright/crawl.go internal/coderun/playwright/base.go internal/coderun/playwright/crawl_test.go
+git add internal/coderun/client.go internal/coderun/playwright/crawl.go internal/coderun/playwright/crawl_test.go
 git commit -m "feat(crawl): list selections, paginate problems, extract statements and templates"
 ```
 
