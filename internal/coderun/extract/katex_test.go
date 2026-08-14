@@ -78,18 +78,24 @@ func TestNormalizeKatexEscapesMarkupInTex(t *testing.T) {
 	// Strict inequalities are everywhere in competitive programming. The TeX
 	// source contains a literal '<', which must never be spliced into an HTML
 	// string and re-parsed as a tag.
+	//
+	// The '<' must be followed immediately by a letter, with no space. HTML5
+	// only enters tag-open state when '<' is directly followed by an ASCII
+	// letter, so "0 < x" survives an unescaped splice by luck while "0<x"
+	// does not. Only the no-space form discriminates a correct implementation
+	// from a broken one.
 	html := `<div id="root"><span class="katex">` +
 		`<span class="katex-mathml"><math><semantics>` +
-		`<annotation encoding="application/x-tex">0 &lt; x &lt; 10</annotation>` +
+		`<annotation encoding="application/x-tex">0&lt;x&lt;10</annotation>` +
 		`</semantics></math></span>` +
-		`<span class="katex-html" aria-hidden="true">0 &lt; x &lt; 10</span></span></div>`
+		`<span class="katex-html" aria-hidden="true">0&lt;x&lt;10</span></span></div>`
 
 	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(html))
 	root := doc.Find("#root")
 	NormalizeKatex(root)
 
-	if got := strings.TrimSpace(root.Text()); got != "$0 < x < 10$" {
-		t.Errorf("got %q, want %q — TeX was re-parsed as markup", got, "$0 < x < 10$")
+	if got := strings.TrimSpace(root.Text()); got != "$0<x<10$" {
+		t.Errorf("got %q, want %q — TeX was re-parsed as markup", got, "$0<x<10$")
 	}
 }
 
