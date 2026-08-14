@@ -1,0 +1,23 @@
+# Browser session — contains authenticated Yandex cookies. Never commit.
+.browser/
+
+# Local secrets
+.env
+
+# Local state and generated artifacts
+data/
+solutions/
+*.db
+*.db-wal
+*.db-shm
+
+# Build output
+/coderun-agent
+/coderun-agent.exe
+/bin/
+
+# Recon scratch
+.playwright-mcp/
+
+# Tooling
+.tokensave/
