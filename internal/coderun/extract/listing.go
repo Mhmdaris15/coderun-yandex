@@ -119,13 +119,28 @@ func rowDifficulty(row *goquery.Selection, title string) string {
 	return ""
 }
 
-// countPages reads the highest numeric label in the pager. A single-page list
-// has no pager, which correctly yields 1.
+// pageLinkLabel matches the pager's per-page control, whose accessible name is
+// "К странице <n>". Matching the ARIA label rather than "any number inside any
+// <nav>" avoids picking up breadcrumbs or unrelated navigation — the page
+// carries both a Breadcrumbs nav and a Pagination nav.
+//
+// This is locale-dependent, which is a real weakness. It is accepted because
+// the alternative is a structural guess that fails silently: an
+// under-counted pager means whole pages of problems are never crawled and no
+// error is raised. ListProblems carries a second guard for that case.
+var pageLinkLabel = regexp.MustCompile(`^К странице (\d+)$`)
+
+// countPages reads the highest page number offered by the pager. A single-page
+// list has no pager, which correctly yields 1.
 func countPages(doc *goquery.Document) int {
 	max := 1
-	doc.Find(`nav a, nav button`).Each(func(_ int, e *goquery.Selection) {
-		n, err := strconv.Atoi(strings.TrimSpace(e.Text()))
-		if err == nil && n > max {
+	doc.Find(`[aria-label]`).Each(func(_ int, e *goquery.Selection) {
+		label, _ := e.Attr("aria-label")
+		m := pageLinkLabel.FindStringSubmatch(strings.TrimSpace(label))
+		if m == nil {
+			return
+		}
+		if n, err := strconv.Atoi(m[1]); err == nil && n > max {
 			max = n
 		}
 	})

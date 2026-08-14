@@ -74,6 +74,42 @@ func TestParseProblemList(t *testing.T) {
 	}
 }
 
+func TestParseProblemListReadsDifficulty(t *testing.T) {
+	// Without this, a stub returning DifficultyUnknown for every row passes
+	// the whole suite. Difficulty is derived by slicing row text after the
+	// title, which is the most fragile extraction in this file.
+	probs, _, err := ParseProblemList(
+		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range probs {
+		if p.Difficulty.Raw == "" {
+			t.Errorf("problem %q has an empty difficulty label — rowDifficulty is not finding it",
+				p.Ref.ProblemSlug)
+		}
+	}
+	if probs[0].Difficulty.Level == coderun.DifficultyUnknown {
+		t.Errorf("problem %q difficulty %q did not map to a known level",
+			probs[0].Ref.ProblemSlug, probs[0].Difficulty.Raw)
+	}
+}
+
+func TestCountPagesWithoutPagerIsOne(t *testing.T) {
+	// A selection short enough to fit on one page has no pager at all. That
+	// must read as exactly one page, not zero.
+	_, pages, err := ParseProblemList(
+		`<div data-testid="problem-list-item">`+
+			`<span role="graphics-symbol" class="ProblemStatus_type_solved__x"></span>`+
+			`<a href="/selections/s/problems/only-one">1. Единственная Средняя</a></div>`, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages != 1 {
+		t.Errorf("pages = %d, want 1 when no pager is present", pages)
+	}
+}
+
 func TestParseProblemListStripsFiltersFromSlug(t *testing.T) {
 	probs, _, err := ParseProblemList(
 		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
