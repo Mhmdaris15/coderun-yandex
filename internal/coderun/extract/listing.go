@@ -82,7 +82,12 @@ func ParseProblemList(html, selectionSlug string) ([]coderun.ProblemSummary, int
 		}
 		slug := m[1]
 
-		number, title := 0, strings.TrimSpace(a.Text())
+		// Normalise before matching. Russian typography puts non-breaking
+		// spaces (U+00A0) after single-letter prepositions — "В двоичном
+		// лесу" — and Go's regexp \s is ASCII-only while strings.Fields and
+		// strings.TrimSpace are Unicode-aware. Mixing the two silently
+		// produces titles that no longer match the text they came from.
+		number, title := 0, normalizeSpace(a.Text())
 		if nm := numberPrefix.FindStringSubmatch(title); nm != nil {
 			number, _ = strconv.Atoi(nm[1])
 			title = strings.TrimSpace(nm[2])
@@ -109,12 +114,25 @@ func ParseProblemList(html, selectionSlug string) ([]coderun.ProblemSummary, int
 	return out, countPages(doc), nil
 }
 
+// normalizeSpace collapses every run of Unicode whitespace — including the
+// non-breaking spaces CodeRun's Russian titles are full of — to a single
+// ASCII space. Both sides of any text comparison in this file must go through
+// it, or a title containing U+00A0 will fail to match the row text it was
+// extracted from.
+func normalizeSpace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // rowDifficulty recovers the difficulty label, which sits in the row's text
 // after the title and has no dedicated test id.
 func rowDifficulty(row *goquery.Selection, title string) string {
-	text := strings.Join(strings.Fields(row.Text()), " ")
-	if i := strings.LastIndex(text, title); i >= 0 {
-		return strings.TrimSpace(text[i+len(title):])
+	needle := normalizeSpace(title)
+	if needle == "" {
+		return ""
+	}
+	text := normalizeSpace(row.Text())
+	if i := strings.LastIndex(text, needle); i >= 0 {
+		return strings.TrimSpace(text[i+len(needle):])
 	}
 	return ""
 }

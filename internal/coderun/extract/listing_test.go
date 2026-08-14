@@ -95,6 +95,35 @@ func TestParseProblemListReadsDifficulty(t *testing.T) {
 	}
 }
 
+func TestParseProblemListHandlesNonBreakingSpaces(t *testing.T) {
+	// "В двоичном лесу" carries a U+00A0 after the single-letter preposition,
+	// which is ordinary Russian typography rather than an edge case. Go's
+	// regexp \s does not match U+00A0 while strings.Fields does, so an
+	// un-normalised pipeline yields a title that cannot be found in its own
+	// row text — and the difficulty silently disappears.
+	probs, _, err := ParseProblemList(
+		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *coderun.ProblemSummary
+	for i := range probs {
+		if probs[i].Ref.ProblemSlug == "binary-forest" {
+			found = &probs[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("binary-forest not found; re-capture the fixture if the selection changed")
+	}
+	if found.Title != normalizeSpace(found.Title) {
+		t.Errorf("Title %q is not whitespace-normalised (likely a stray U+00A0)", found.Title)
+	}
+	if found.Difficulty.Raw == "" {
+		t.Error("difficulty was lost for a title containing a non-breaking space")
+	}
+}
+
 func TestCountPagesWithoutPagerIsOne(t *testing.T) {
 	// A selection short enough to fit on one page has no pager at all. That
 	// must read as exactly one page, not zero.
