@@ -68,3 +68,37 @@ func TestLoadRejectsBadDuration(t *testing.T) {
 		t.Fatal("expected an error for an unparseable duration")
 	}
 }
+
+func TestLoadRejectsBadBool(t *testing.T) {
+	t.Setenv("CODERUN_SKIP_DOTENV", "1")
+	t.Setenv("HEADLESS", "ture")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for an unparseable bool, not a silent fallback to the default")
+	}
+}
+
+func TestLoadRejectsBadInt(t *testing.T) {
+	t.Setenv("CODERUN_SKIP_DOTENV", "1")
+	t.Setenv("MAX_SOURCE_BYTES", "lots")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for an unparseable int, not a silent fallback to the default")
+	}
+}
+
+func TestLoadRejectsNonPositiveByteLimits(t *testing.T) {
+	// A non-positive MAX_ARTIFACT_BYTES would otherwise panic later at
+	// raw[:maxBytes] in verdict.go, so both limits must be rejected here.
+	for _, key := range []string{"MAX_SOURCE_BYTES", "MAX_ARTIFACT_BYTES"} {
+		for _, val := range []string{"0", "-1"} {
+			t.Run(key+"="+val, func(t *testing.T) {
+				t.Setenv("CODERUN_SKIP_DOTENV", "1")
+				t.Setenv(key, val)
+				if _, err := Load(); err == nil {
+					t.Fatalf("expected an error for %s=%s", key, val)
+				}
+			})
+		}
+	}
+}

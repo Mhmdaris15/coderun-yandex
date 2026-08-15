@@ -1,6 +1,7 @@
 package pwclient
 
 import (
+	"strings"
 	"testing"
 
 	"coderun-agent/internal/coderun"
@@ -40,5 +41,38 @@ func TestParseContextIDMissing(t *testing.T) {
 func TestParseContextIDNotANumber(t *testing.T) {
 	if _, err := ParseContextID("https://x/?problemContextId=abc"); err == nil {
 		t.Fatal("expected an error for a non-numeric id")
+	}
+}
+
+func TestParseTemplateResponse(t *testing.T) {
+	body := []byte(`{"result":{"content":"def solution(n, a):\n    pass\n"},"error":null}`)
+	got, err := ParseTemplateResponse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "def solution(n, a):\n    pass\n" {
+		t.Errorf("content = %q", got)
+	}
+}
+
+func TestParseTemplateResponseSurfacesAPIError(t *testing.T) {
+	// Without checking the error object, this looks identical to an empty
+	// (but successful) template.
+	body := []byte(`{"result":null,"error":{"statusCode":404,"code":"not-found","message":"no such problem"}}`)
+	_, err := ParseTemplateResponse(body)
+	if err == nil {
+		t.Fatal("expected an error when the API returns one")
+	}
+	for _, want := range []string{"no such problem", "not-found", "404"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not surface %q from the API error object", err, want)
+		}
+	}
+}
+
+func TestParseTemplateResponseRejectsEmptyContent(t *testing.T) {
+	body := []byte(`{"result":{"content":""},"error":null}`)
+	if _, err := ParseTemplateResponse(body); err == nil {
+		t.Fatal("expected an error when the template has no content: a solution needs it")
 	}
 }

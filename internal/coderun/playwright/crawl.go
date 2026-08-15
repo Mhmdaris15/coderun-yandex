@@ -63,6 +63,11 @@ func (b *Browser) ListSelections(ctx context.Context, group string) ([]coderun.S
 	return sels, nil
 }
 
+// pageSize is the page size the site's own pager uses. Do not raise this
+// above the observed 20: an unvalidated parameter against an undocumented
+// endpoint is exactly the kind of thing that gets an account flagged.
+const pageSize = 20
+
 // ListProblems walks every page of a selection's problem list.
 func (b *Browser) ListProblems(ctx context.Context, selectionSlug string) ([]coderun.ProblemSummary, error) {
 	var all []coderun.ProblemSummary
@@ -81,11 +86,10 @@ func (b *Browser) ListProblems(ctx context.Context, selectionSlug string) ([]cod
 			// live against the 2025-summer-common selection, see
 			// TestIntegrationListProblemsPaginates. Sending ?filters= here
 			// was silently ignored, which is why every page repeated page 1.
-			f := extract.DefaultFilters(page)
 			q := url.Values{}
-			q.Set("currentPage", strconv.Itoa(f.CurrentPage))
-			q.Set("pageSize", strconv.Itoa(f.PageSize))
-			q.Set("search", f.Search)
+			q.Set("currentPage", strconv.Itoa(page))
+			q.Set("pageSize", strconv.Itoa(pageSize))
+			q.Set("search", "")
 			path += "?" + q.Encode()
 		}
 
@@ -106,7 +110,7 @@ func (b *Browser) ListProblems(ctx context.Context, selectionSlug string) ([]cod
 			// be an undetected page 1 of N than a selection that happens to
 			// end on the boundary. Under-crawling produces no error of its
 			// own — whole pages simply never appear — so say so loudly.
-			if totalPages == 1 && len(probs) >= extract.DefaultFilters(1).PageSize {
+			if totalPages == 1 && len(probs) >= pageSize {
 				slog.Warn("selection reports one page but is exactly full; the pager may not have been detected",
 					"selection", selectionSlug, "problems", len(probs))
 			}
@@ -189,15 +193,33 @@ func (b *Browser) GetTemplate(ctx context.Context, ref coderun.ProblemRef, compi
 	if err != nil {
 		return "", err
 	}
+	return ParseTemplateResponse(body)
+}
 
+// ParseTemplateResponse decodes GET /api/problem/<slug>/solution-template. An
+// API-level error is surfaced explicitly, matching ParseSubmitResponse and
+// ParseSubmissionDetail: without this, an error response looks exactly like
+// an empty template, which is silently useless to write a solution against.
+func ParseTemplateResponse(body []byte) (string, error) {
 	var payload struct {
 		Result struct {
 			Content string `json:"content"`
 		} `json:"result"`
-		Error json.RawMessage `json:"error"`
+		Error *struct {
+			StatusCode int    `json:"statusCode"`
+			Code       string `json:"code"`
+			Message    string `json:"message"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", fmt.Errorf("decode template response: %w", err)
+	}
+	if payload.Error != nil {
+		return "", fmt.Errorf("solution template rejected: %s (%s, status %d)",
+			payload.Error.Message, payload.Error.Code, payload.Error.StatusCode)
+	}
+	if payload.Result.Content == "" {
+		return "", fmt.Errorf("solution template response carried no content")
 	}
 	return payload.Result.Content, nil
 }

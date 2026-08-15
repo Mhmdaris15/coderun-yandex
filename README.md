@@ -6,8 +6,12 @@ and submit a manually supplied source file. No LLM yet.
 ## Setup
 
     go build ./...
-    go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium --with-deps
+    go run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.0 install chromium --with-deps
     cp .env.example .env
+
+The installer version above must match the `github.com/mxschmitt/playwright-go`
+version pinned in `go.mod`, or the downloaded browser driver can mismatch the
+library and fail at runtime.
 
 ## Usage
 

@@ -11,6 +11,6 @@ type CodeRunClient interface {
 	ListProblems(ctx context.Context, selectionSlug string) ([]ProblemSummary, error)
 	GetProblem(ctx context.Context, ref ProblemRef) (*Problem, int, error)
 	GetTemplate(ctx context.Context, ref ProblemRef, compilerSlug string) (string, error)
-	Submit(ctx context.Context, ref ProblemRef, compilerSlug string, sourcePath string) (*Submission, error)
+	Submit(ctx context.Context, ref ProblemRef, compilerSlug string, sourcePath string) (*Submission, []byte, error)
 	GetSubmission(ctx context.Context, globalID string) (*Submission, error)
 }

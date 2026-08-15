@@ -32,12 +32,12 @@ func TestUpsertSelectionsIsIdempotent(t *testing.T) {
 		}
 	}
 
-	got, err := s.ListSelections(ctx)
-	if err != nil {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM selections`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %d selections after two upserts, want 2", len(got))
+	if count != 2 {
+		t.Fatalf("got %d selections after two upserts, want 2", count)
 	}
 }
 
@@ -96,19 +96,14 @@ func TestContextIDSurvivesReopen(t *testing.T) {
 	}
 	defer s2.Close()
 
-	got, err := s2.GetContextID(ctx, "sel", "p1")
-	if err != nil {
+	var got int
+	if err := s2.db.QueryRowContext(ctx,
+		`SELECT context_id FROM problems WHERE selection_slug = ? AND problem_slug = ?`,
+		"sel", "p1").Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if got != 1838 {
 		t.Errorf("ContextID = %d, want 1838", got)
-	}
-}
-
-func TestGetContextIDMissing(t *testing.T) {
-	s := newStore(t)
-	if _, err := s.GetContextID(context.Background(), "nope", "nope"); err == nil {
-		t.Fatal("expected an error for an unknown problem")
 	}
 }
 
@@ -117,7 +112,7 @@ func TestNextAttemptIncrements(t *testing.T) {
 	s := newStore(t)
 
 	for want := 1; want <= 3; want++ {
-		got, err := s.NextAttempt(ctx, "sel", "p1")
+		got, err := s.NextAttempt(ctx, "sel", "p1", "python_make")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -126,7 +121,7 @@ func TestNextAttemptIncrements(t *testing.T) {
 		}
 	}
 	// A different problem numbers independently.
-	got, err := s.NextAttempt(ctx, "sel", "p2")
+	got, err := s.NextAttempt(ctx, "sel", "p2", "python_make")
 	if err != nil {
 		t.Fatal(err)
 	}

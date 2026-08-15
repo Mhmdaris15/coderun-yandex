@@ -131,25 +131,6 @@ func (s *Store) UpsertSelections(ctx context.Context, sels []coderun.Selection) 
 	return tx.Commit()
 }
 
-func (s *Store) ListSelections(ctx context.Context) ([]coderun.Selection, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT slug, title, grp, problem_count FROM selections ORDER BY slug`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []coderun.Selection
-	for rows.Next() {
-		var sel coderun.Selection
-		if err := rows.Scan(&sel.Slug, &sel.Title, &sel.Group, &sel.ProblemCount); err != nil {
-			return nil, err
-		}
-		out = append(out, sel)
-	}
-	return out, rows.Err()
-}
-
 // UpsertProblems preserves any context_id already discovered: listing pages do
 // not carry it, so a naive overwrite would erase it on every re-crawl.
 func (s *Store) UpsertProblems(ctx context.Context, probs []coderun.ProblemSummary) error {
@@ -192,20 +173,6 @@ func (s *Store) SetContextID(ctx context.Context, ref coderun.ProblemRef) error 
 	return err
 }
 
-func (s *Store) GetContextID(ctx context.Context, selectionSlug, problemSlug string) (int, error) {
-	var id sql.NullInt64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT context_id FROM problems WHERE selection_slug = ? AND problem_slug = ?`,
-		selectionSlug, problemSlug).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("context id for %s/%s: %w", selectionSlug, problemSlug, err)
-	}
-	if !id.Valid {
-		return 0, fmt.Errorf("context id for %s/%s not discovered yet", selectionSlug, problemSlug)
-	}
-	return int(id.Int64), nil
-}
-
 func (s *Store) SaveProblem(ctx context.Context, p *coderun.Problem) error {
 	blob, err := marshalProblem(p)
 	if err != nil {
@@ -228,7 +195,7 @@ func (s *Store) SaveProblem(ctx context.Context, p *coderun.Problem) error {
 }
 
 // NextAttempt reserves and returns the next attempt number for a problem.
-func (s *Store) NextAttempt(ctx context.Context, selectionSlug, problemSlug string) (int, error) {
+func (s *Store) NextAttempt(ctx context.Context, selectionSlug, problemSlug, compilerSlug string) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -243,9 +210,9 @@ func (s *Store) NextAttempt(ctx context.Context, selectionSlug, problemSlug stri
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO attempts (selection_slug, problem_slug, attempt, created_at)
-         VALUES (?, ?, ?, ?)`,
-		selectionSlug, problemSlug, next, time.Now().UTC()); err != nil {
+		`INSERT INTO attempts (selection_slug, problem_slug, attempt, compiler_slug, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+		selectionSlug, problemSlug, next, compilerSlug, time.Now().UTC()); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

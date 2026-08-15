@@ -35,15 +35,28 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Headless:          envBool("HEADLESS", false),
 		BrowserProfileDir: envStr("BROWSER_PROFILE_DIR", ".browser"),
-		MaxConcurrentJobs: envInt("MAX_CONCURRENT_JOBS", 1),
 		DBPath:            envStr("DB_PATH", "data/coderun.db"),
-		MaxSourceBytes:    int64(envInt("MAX_SOURCE_BYTES", 262144)),
-		MaxArtifactBytes:  int64(envInt("MAX_ARTIFACT_BYTES", 262144)),
 	}
 
 	var err error
+	if cfg.Headless, err = envBool("HEADLESS", false); err != nil {
+		return nil, err
+	}
+	if cfg.MaxConcurrentJobs, err = envInt("MAX_CONCURRENT_JOBS", 1); err != nil {
+		return nil, err
+	}
+	maxSourceBytes, err := envInt("MAX_SOURCE_BYTES", 262144)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxSourceBytes = int64(maxSourceBytes)
+	maxArtifactBytes, err := envInt("MAX_ARTIFACT_BYTES", 262144)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxArtifactBytes = int64(maxArtifactBytes)
+
 	if cfg.RequestDelay, err = envDur("REQUEST_DELAY", time.Second); err != nil {
 		return nil, err
 	}
@@ -59,8 +72,14 @@ func Load() (*Config, error) {
 	if cfg.MaxConcurrentJobs != 1 {
 		return nil, fmt.Errorf("MAX_CONCURRENT_JOBS must be 1 in this milestone, got %d", cfg.MaxConcurrentJobs)
 	}
+	if cfg.MaxSourceBytes <= 0 {
+		return nil, fmt.Errorf("MAX_SOURCE_BYTES must be positive, got %d", cfg.MaxSourceBytes)
+	}
 	if cfg.MaxSourceBytes > 262144 {
 		return nil, fmt.Errorf("MAX_SOURCE_BYTES must not exceed 262144 (CodeRun's limit), got %d", cfg.MaxSourceBytes)
+	}
+	if cfg.MaxArtifactBytes <= 0 {
+		return nil, fmt.Errorf("MAX_ARTIFACT_BYTES must be positive, got %d", cfg.MaxArtifactBytes)
 	}
 	return cfg, nil
 }
@@ -72,28 +91,32 @@ func envStr(key, def string) string {
 	return def
 }
 
-func envBool(key string, def bool) bool {
+// envBool and envInt fail loudly on an unparseable value rather than quietly
+// falling back to the default: a malformed HEADLESS=ture must not silently
+// run headed, and a malformed byte limit must not silently keep a default
+// that may not be what the operator intended.
+func envBool(key string, def bool) (bool, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		return def
+		return def, nil
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		return def
+		return false, fmt.Errorf("%s: %w", key, err)
 	}
-	return b
+	return b, nil
 }
 
-func envInt(key string, def int) int {
+func envInt(key string, def int) (int, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		return def
+		return def, nil
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return 0, fmt.Errorf("%s: %w", key, err)
 	}
-	return n
+	return n, nil
 }
 
 func envDur(key string, def time.Duration) (time.Duration, error) {

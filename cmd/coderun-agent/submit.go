@@ -46,19 +46,16 @@ func submitCmd() *cobra.Command {
 					return err
 				}
 
-				// Read the source BEFORE submitting. Submitting is the point of
-				// no return: it takes an action on a live platform that counts
-				// against the user's record. Anything that can fail must fail
-				// before it, so that nothing sits between the submission and the
-				// record of that submission.
-				source, err := readFile(file)
-				if err != nil {
-					return err
-				}
 				ext := strings.TrimPrefix(filepath.Ext(file), ".")
 
+				// Submit reads and validates the source file itself, before
+				// touching the browser, and returns exactly those bytes
+				// alongside the submission. Using its return value (rather
+				// than reading the file again here) guarantees the artifact
+				// recorded below is byte-for-byte what was uploaded, even if
+				// the file on disk changes in between.
 				fmt.Printf("[2/4] Submitting %s as %s...\n", file, slug)
-				sub, err := b.Submit(ctx, ref, slug, file)
+				sub, source, err := b.Submit(ctx, ref, slug, file)
 				unconfirmed := errors.Is(err, pwclient.ErrSubmitUnconfirmed)
 				if err != nil && !unconfirmed {
 					// Nothing was confirmed submitted and there is nothing to
@@ -74,7 +71,7 @@ func submitCmd() *cobra.Command {
 				// A submission may now exist on CodeRun's servers — confirmed,
 				// or not. Every exit path from here must leave the user able to
 				// find it again.
-				attempt, attemptErr := st.NextAttempt(ctx, ref.SelectionSlug, ref.ProblemSlug)
+				attempt, attemptErr := st.NextAttempt(ctx, ref.SelectionSlug, ref.ProblemSlug, slug)
 				if attemptErr != nil {
 					// No attempt number means no artifact filename. The globalId
 					// (if any) goes into the error text, because it is the only

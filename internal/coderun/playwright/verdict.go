@@ -3,6 +3,7 @@ package pwclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -212,13 +213,16 @@ func (b *Browser) fetchArtifact(ctx context.Context, link string, maxBytes int64
 	default:
 	}
 
-	// Note: the URL is deliberately absent from this log line. Presigned links
-	// are credentials.
+	// Note: the URL is deliberately absent from this log line, and from every
+	// error below. Presigned links are 12-hour bearer credentials, and
+	// playwright-go's transport errors embed the request URL in their own
+	// message text — so those errors must never be wrapped or logged
+	// verbatim, only reported as a sanitised, fixed message.
 	slog.Debug("fetching test artifact", "url", "<presigned>")
 
 	resp, err := b.Ctx.Request().Get(link)
 	if err != nil {
-		return "", fmt.Errorf("fetch <presigned>: %w", err)
+		return "", errors.New("fetch <presigned>: request failed")
 	}
 	defer resp.Dispose()
 
@@ -227,7 +231,7 @@ func (b *Browser) fetchArtifact(ctx context.Context, link string, maxBytes int64
 	}
 	raw, err := resp.Body()
 	if err != nil {
-		return "", err
+		return "", errors.New("fetch <presigned>: could not read response body")
 	}
 	if int64(len(raw)) > maxBytes {
 		raw = raw[:maxBytes]

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
 	"coderun-agent/internal/coderun"
@@ -18,6 +19,14 @@ import (
 // latest-submission fallback could not recover a globalId either. A real
 // submission may exist; callers must never resubmit to "fix" this.
 var ErrSubmitUnconfirmed = errors.New("submit unconfirmed: a submission may exist on CodeRun but was not verified locally")
+
+// errSubmitBodyUnparseable marks a decode failure in ParseSubmitResponse as
+// ambiguous rather than a confirmed rejection: the confirming click reached
+// the server (a response came back), but nothing about its outcome could be
+// read from it. Submit treats this the same as a missed response — through
+// ErrSubmitUnconfirmed — rather than as a confirmed failure with nothing to
+// recover.
+var errSubmitBodyUnparseable = errors.New("submit response body could not be decoded")
 
 // ValidateSource enforces CodeRun's stated upload limit locally.
 func ValidateSource(source []byte, maxBytes int64) error {
@@ -44,7 +53,7 @@ func ParseSubmitResponse(body []byte) (string, string, error) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", "", fmt.Errorf("decode submit response: %w", err)
+		return "", "", fmt.Errorf("%w: %v", errSubmitBodyUnparseable, err)
 	}
 	if payload.Error != nil {
 		return "", "", fmt.Errorf("submit rejected: %s (%s, status %d)",
@@ -60,27 +69,46 @@ func ParseSubmitResponse(body []byte) (string, string, error) {
 //
 // The response listener is registered before the confirming click so the
 // globalId is captured exactly, with no race against the redirect that
-// follows.
-func (b *Browser) Submit(ctx context.Context, ref coderun.ProblemRef, compilerSlug, sourcePath string) (*coderun.Submission, error) {
+// follows. It returns the exact bytes it read from sourcePath alongside the
+// submission (whenever it got far enough to read them), so a caller
+// archiving an attempt artifact records precisely what was uploaded rather
+// than a second, possibly different, read of the same path.
+func (b *Browser) Submit(ctx context.Context, ref coderun.ProblemRef, compilerSlug, sourcePath string) (*coderun.Submission, []byte, error) {
 	source, err := os.ReadFile(sourcePath)
 	if err != nil {
-		return nil, fmt.Errorf("read source: %w", err)
+		return nil, nil, fmt.Errorf("read source: %w", err)
 	}
 	if err := ValidateSource(source, b.maxSource); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if _, err := b.Goto(ctx, ProblemPath(ref, compilerSlug)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := b.Page.GetByTestId("file-attach").Click(); err != nil {
-		return nil, fmt.Errorf("open the upload dialog: %w", err)
+		return nil, nil, fmt.Errorf("open the upload dialog: %w", err)
+	}
+
+	// Stage the exact bytes just validated into a fresh temp file and point
+	// the browser at that, rather than at sourcePath again. This is the only
+	// file the browser ever reads for the upload, so what is archived below
+	// as "source" is guaranteed to match exactly what was sent, even if
+	// sourcePath is edited on disk between validation and upload.
+	stageDir, err := os.MkdirTemp("", "coderun-submit-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create upload staging directory: %w", err)
+	}
+	defer os.RemoveAll(stageDir)
+
+	stagedPath := filepath.Join(stageDir, filepath.Base(sourcePath))
+	if err := os.WriteFile(stagedPath, source, 0o644); err != nil {
+		return nil, nil, fmt.Errorf("stage source for upload: %w", err)
 	}
 
 	input := b.Page.Locator(`[data-testid="file-attach-modal"] input[type=file]`)
-	if err := input.SetInputFiles([]string{sourcePath}); err != nil {
-		return nil, fmt.Errorf("attach %s: %w", sourcePath, err)
+	if err := input.SetInputFiles([]string{stagedPath}); err != nil {
+		return nil, nil, fmt.Errorf("attach %s: %w", sourcePath, err)
 	}
 
 	submittedAt := time.Now().UTC()
@@ -89,36 +117,32 @@ func (b *Browser) Submit(ctx context.Context, ref coderun.ProblemRef, compilerSl
 		return b.Page.GetByTestId("confirm").Click()
 	})
 	if err != nil {
-		// The click may have landed even though the response was missed. Do
-		// not retry: a blind resubmit could double-submit. Instead, ask
-		// CodeRun what its latest submission for this problem/compiler is: if
-		// it was submitted at or after our click, it is ours.
-		if globalID, ok := b.recoverLatestSubmission(ctx, ref, compilerSlug, submittedAt); ok {
-			slog.Warn("submit response missed; recovered globalId from the latest-submission fallback",
-				"submission", globalID)
-			return &coderun.Submission{
-				GlobalID:     globalID,
-				Ref:          ref,
-				CompilerSlug: compilerSlug,
-				SubmittedAt:  submittedAt,
-			}, nil
-		}
-		return &coderun.Submission{
-				Ref:          ref,
-				CompilerSlug: compilerSlug,
-				Status:       "UNCONFIRMED",
-				SubmittedAt:  submittedAt,
-			}, fmt.Errorf("%w: submit sent but the response was not captured (do not retry blindly): %v",
-				ErrSubmitUnconfirmed, err)
+		sub, subErr := b.unconfirmedSubmission(ctx, ref, compilerSlug, submittedAt, err)
+		return sub, source, subErr
 	}
 
 	body, err := resp.Body()
 	if err != nil {
-		return nil, fmt.Errorf("read submit response: %w", err)
+		// The click landed and a response object came back, but its body
+		// could not be read. This is the same ambiguous window as a missed
+		// response: a submission may exist server-side with nothing local to
+		// prove it, so it must not vanish silently.
+		sub, subErr := b.unconfirmedSubmission(ctx, ref, compilerSlug, submittedAt,
+			fmt.Errorf("read submit response: %w", err))
+		return sub, source, subErr
 	}
 	globalID, status, err := ParseSubmitResponse(body)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, errSubmitBodyUnparseable) {
+			sub, subErr := b.unconfirmedSubmission(ctx, ref, compilerSlug, submittedAt, err)
+			return sub, source, subErr
+		}
+		// Any other ParseSubmitResponse error (an explicit API rejection, or
+		// a response with neither an error nor a globalId) is a conclusive
+		// signal read straight from a fully-parsed response, not an ambiguous
+		// one — so it is reported as-is rather than routed through the
+		// unconfirmed/recovery path.
+		return nil, source, err
 	}
 
 	slog.Info("submitted", "problem", ref.ProblemSlug, "compiler", compilerSlug, "submission", globalID)
@@ -129,7 +153,34 @@ func (b *Browser) Submit(ctx context.Context, ref coderun.ProblemRef, compilerSl
 		CompilerSlug: compilerSlug,
 		Status:       status,
 		SubmittedAt:  submittedAt,
-	}, nil
+	}, source, nil
+}
+
+// unconfirmedSubmission handles every path where the confirming click may
+// have reached CodeRun's servers but the outcome could not be verified
+// locally — whether the response was never captured, or one came back but
+// its body could not be read or decoded. It never retries the click (a blind
+// resubmit could double-submit); instead it asks CodeRun for the latest
+// submission on this problem/compiler, accepting it only if it postdates the
+// click.
+func (b *Browser) unconfirmedSubmission(ctx context.Context, ref coderun.ProblemRef, compilerSlug string, submittedAt time.Time, cause error) (*coderun.Submission, error) {
+	if globalID, ok := b.recoverLatestSubmission(ctx, ref, compilerSlug, submittedAt); ok {
+		slog.Warn("submit response missed; recovered globalId from the latest-submission fallback",
+			"submission", globalID)
+		return &coderun.Submission{
+			GlobalID:     globalID,
+			Ref:          ref,
+			CompilerSlug: compilerSlug,
+			SubmittedAt:  submittedAt,
+		}, nil
+	}
+	return &coderun.Submission{
+			Ref:          ref,
+			CompilerSlug: compilerSlug,
+			Status:       "UNCONFIRMED",
+			SubmittedAt:  submittedAt,
+		}, fmt.Errorf("%w: submit sent but the response was not captured (do not retry blindly): %v",
+			ErrSubmitUnconfirmed, cause)
 }
 
 // recoverLatestSubmission asks CodeRun for its latest submission on this
