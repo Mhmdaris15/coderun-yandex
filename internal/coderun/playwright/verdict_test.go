@@ -1,6 +1,7 @@
 package pwclient
 
 import (
+	"strings"
 	"testing"
 
 	"coderun-agent/internal/coderun"
@@ -100,7 +101,50 @@ func TestIsAcceptedIsClosedOnSuccessOnly(t *testing.T) {
 
 func TestParseSubmissionDetailSurfacesAPIError(t *testing.T) {
 	body := []byte(`{"result":null,"error":{"statusCode":404,"code":"not-found","message":"nope"}}`)
-	if _, _, err := ParseSubmissionDetail(body); err == nil {
+
+	_, _, err := ParseSubmissionDetail(body)
+	if err == nil {
 		t.Fatal("expected an error when the API returns one")
+	}
+	// Asserting only that err != nil would pass against an implementation that
+	// never reads the error object at all and simply reports "no result".
+	// Require the API's own fields to reach the caller, since they are what
+	// makes a failure diagnosable.
+	for _, want := range []string{"nope", "not-found", "404"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not surface %q from the API error object", err, want)
+		}
+	}
+}
+
+func TestParseSubmissionDetailPicksFirstGenuinelyFailedTest(t *testing.T) {
+	// Three sample tests: one passed, one has not run yet (empty verdict), one
+	// failed. The artifact links must come from the failed one. Picking the
+	// wrong test would put one test's expected output beside another's actual
+	// — silently misleading rather than obviously broken.
+	body := []byte(`{"result":{
+	 "globalId":"g","verdict":"WRONG_ANSWER","status":"FINISHED",
+	 "openTests":{"totalTests":3,"tests":[
+	   {"testNumber":1,"isSample":true,"verdict":"OK",
+	    "input":{"link":"https://s3/in1"},"output":{"link":"https://s3/out1"},"answer":{"link":"https://s3/ans1"}},
+	   {"testNumber":2,"isSample":true,"verdict":"",
+	    "input":{"link":"https://s3/in2"},"output":{"link":"https://s3/out2"},"answer":{"link":"https://s3/ans2"}},
+	   {"testNumber":3,"isSample":true,"verdict":"WRONG_ANSWER",
+	    "input":{"link":"https://s3/in3"},"output":{"link":"https://s3/out3"},"answer":{"link":"https://s3/ans3"}}]},
+	 "hiddenTests":{"totalTests":0},
+	 "runtimeLimits":{"timeLimitMillis":1000,"memoryLimitBytes":1}},"error":null}`)
+
+	sub, links, err := ParseSubmissionDetail(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sub.OpenTests) != 3 {
+		t.Fatalf("got %d open tests, want 3", len(sub.OpenTests))
+	}
+	if len(links) != 3 {
+		t.Fatalf("got %d links, want 3", len(links))
+	}
+	if links[0] != "https://s3/in3" || links[1] != "https://s3/out3" || links[2] != "https://s3/ans3" {
+		t.Errorf("links came from the wrong test: %v", links)
 	}
 }
