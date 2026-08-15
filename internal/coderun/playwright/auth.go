@@ -2,6 +2,7 @@ package pwclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -12,10 +13,15 @@ import (
 const loginMarker = `data-testid="log-in"`
 
 // IsLoggedIn reports whether a CodeRun page was rendered for an authenticated
-// user. Absence of the log-in control is the signal; an empty page is never
-// treated as logged in.
+// user.
+//
+// Absence of the log-in control is the signal, but absence alone is not
+// enough: a gateway error page, a redirect stub or an empty body all lack that
+// control purely by accident and would otherwise read as a valid session. So
+// the page must first be recognisable as a CodeRun page at all. The Next.js
+// data blob is the cheapest positive marker that is not locale-dependent.
 func IsLoggedIn(html string) bool {
-	if strings.TrimSpace(html) == "" {
+	if !strings.Contains(html, "__NEXT_DATA__") {
 		return false
 	}
 	return !strings.Contains(html, loginMarker)
@@ -35,8 +41,11 @@ func (b *Browser) AuthStatus(ctx context.Context) (bool, error) {
 	return IsLoggedIn(html), nil
 }
 
+// isChallenge uses the sentinel rather than matching error text. Goto wraps
+// ErrChallenge with %w precisely so this works; string matching would break
+// silently the moment the sentinel's message is reworded.
 func isChallenge(err error) bool {
-	return err != nil && strings.Contains(err.Error(), ErrChallenge.Error())
+	return errors.Is(err, ErrChallenge)
 }
 
 // AwaitLogin opens the Yandex login page and waits for the operator to finish.
