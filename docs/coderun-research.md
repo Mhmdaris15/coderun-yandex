@@ -12,10 +12,27 @@ One real submission was made during recon (a deliberately wrong Python solution 
   `buildId` changes every deploy — never hardcode it or `/_next/data/<buildId>/` URLs.
 - CSS Modules, hashed class names (`SelectionCard_selection-card__link__m3s24`).
   Confirms PLAN.md §7: **never select on class names.** Use `data-testid`, roles, hrefs.
-- **Pages are server-rendered into HTML.** No client-side hydration is required to read
-  selections, problem lists or statements — so a plain HTTP GET + HTML parse is
-  sufficient. `pageProps.queryValues` (a dehydrated React Query cache) is empty on all
-  three page types, so there is no free structured JSON in the page.
+- **Rendering is mixed, and the split matters.** Corrected 2026-08-14 after a plain
+  `http.Get` capture of all three page types:
+
+  | Content | In server HTML? |
+  |---|---|
+  | Selection cards | **Yes** |
+  | Problem list rows (`problem-list-item`) | **Yes** |
+  | Problem title (`problem-title`) | **Yes** |
+  | Statement body, `Формат ввода`, KaTeX, `code-snippet` examples | **No — client-rendered** |
+
+  So listings can be read with a plain HTTP GET, but **problem statements cannot**:
+  the page shell arrives server-rendered and the statement is filled in after
+  hydration. Any statement extraction must read the DOM *after* JavaScript has run
+  (`page.Content()`), not the raw HTTP response body.
+
+  `pageProps.queryValues` (a dehydrated React Query cache) is empty on all three page
+  types, so there is no free structured JSON in the page either.
+
+  This was originally recorded as "everything is server-rendered", inferred from
+  reading the live DOM in a browser — which necessarily showed post-JavaScript state.
+  The distinction only surfaced when raw HTML was fetched without a browser.
 
 ## Authentication
 
@@ -264,6 +281,48 @@ Crawling (PLAN.md phases 3–5) can therefore be built and tested with zero auth
   `quickstart` (2), `yainterview` (6), `thematic` (7); subgroups e.g. `&subgroup=2025-summer`.
 - `bridge-to-the-palace`: number 2, difficulty `Средняя`, 2 samples, 83 hidden tests,
   `problemContextId=1838`, TL 2000 ms, ML 256 MB.
+
+## Future improvement — structured problem data in `__NEXT_DATA__`
+
+Found 2026-08-15 while reviewing the listing parsers. **Not adopted**: the DOM
+parsers were already built and tested, and the decision was taken to keep them and
+revisit this later. Recorded here so the option is not lost.
+
+`__NEXT_DATA__.props.pageProps.values` on a selection page contains a fully
+structured problem list. Verified against the committed fixture for
+`2025-summer-common`:
+
+```json
+{"id":1838,"slug":"bridge-to-the-palace","difficulty":"MEDIUM",
+ "solutionState":"NOT_SOLVED","order":2,"compilerLanguages":["python", …]}
+```
+
+plus `"total":25` and `"problemsAmount":25` at the container level.
+
+Why it is better than the DOM path currently in use:
+
+| DOM approach in use | JSON equivalent |
+|---|---|
+| Difficulty from Russian text (`Средняя`) | `"difficulty":"MEDIUM"` — canonical, locale-independent |
+| Status from the `ProblemStatus_type_<token>__` class fragment | `"solutionState":"NOT_SOLVED"` |
+| Page count from the pager's `aria-label="К странице N"` | `"total":25` — exact, no pager parsing |
+| Titles carrying U+00A0, needing whitespace normalisation | clean titles |
+| `problemContextId` discovered by intercepting the `solution-template` request | `"id":1838` — present in the page |
+
+The last row is the most valuable: `1838` is the same `problemContextId` this
+document records as discoverable only through network interception. It is in the
+HTML the whole time.
+
+**Caveat.** The payload sits under obfuscated, build-specific keys such as
+`"7kyt1swa|33cvww5a"`, so any implementation must locate it **by shape** — search
+`pageProps.values` for an object holding an array whose elements have both `slug`
+and `difficulty` — never by key name.
+
+Note for the record: an earlier pass over `pageProps.values` dismissed it as an
+i18n/experiments blob. That was wrong, and several fragilities in the DOM path
+(locale-dependent difficulty parsing, pager detection, NBSP handling, ContextID
+discovery) trace back to that misreading. `queryValues.queries` genuinely is empty;
+`values` is where the data lives.
 
 ## Still open
 

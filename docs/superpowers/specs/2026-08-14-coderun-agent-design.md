@@ -240,7 +240,13 @@ iterate pages, honouring `REQUEST_DELAY` between navigations. Do **not** raise
 `pageSize` beyond the observed 20 — an unvalidated parameter against an undocumented
 endpoint is exactly the kind of thing that gets an account flagged.
 
-Encoding this blob is done by a single tested helper; it is a documented fragile point.
+**This turned out to be wrong — see §18.** The `?filters=` blob above is only what
+problem-detail links carry to restore list state; sending it as a pagination
+parameter is silently ignored by the server. The site's own pager instead turns
+pages with plain `currentPage`/`pageSize`/`search` query parameters. The
+`extract.Filters`/`EncodeFilters`/`DecodeFilters` helper this section originally
+called for has been deleted; see `docs/coderun-research.md` and
+`internal/coderun/playwright/crawl.go`.
 
 ### 5.3 Problem detail
 
@@ -451,7 +457,8 @@ Per PLAN.md §22, scoped to this milestone.
   Fixtures captured during recon and refreshed deliberately.
 - Verdict logic: table-driven over recorded JSON, **including an unknown-verdict case**
   asserting it is treated as not-accepted.
-- `?filters=` encode/decode round-trip.
+- ~~`?filters=` encode/decode round-trip.~~ Removed along with the dead
+  `extract.Filters`/`EncodeFilters`/`DecodeFilters` code — see §18.
 - Storage: migrations, resume-after-restart, attempt numbering.
 
 **Integration**, behind `//go:build integration`, never in the default suite:
@@ -483,8 +490,10 @@ LLM spec.
 1. **`compilerSlug` scraping** depends on the option `id` attribute — an undocumented
    UI internal. If it changes, language selection breaks. Mitigated by failing loudly
    with the scraped list rather than falling back to a guess.
-2. **`?filters=` pagination blob** is an undocumented, double-encoded UI internal, and
-   is load-bearing for problem discovery.
+2. ~~**`?filters=` pagination blob** is an undocumented, double-encoded UI internal, and
+   is load-bearing for problem discovery.~~ **Wrong — see §18.** It is not load-bearing:
+   the pager turns pages with plain `currentPage`/`pageSize`/`search` query parameters,
+   and the `?filters=` blob is only carried by problem-detail links.
 3. **Headless fingerprint change** may invalidate a headed session.
 4. **Verdict vocabulary is incomplete.** Handled by the open-set rule.
 5. **ToS.** Automating submissions to a live contest platform likely conflicts with
@@ -503,3 +512,20 @@ LLM spec.
 - `submit … --file solution.py --lang python` submits, polls, and records a verdict
   with per-test detail.
 - Default `go test ./...` passes with no browser and no network.
+
+## 18. Departures from this spec, as built
+
+§15 tracks where the code diverges from PLAN.md. This section tracks where it
+also diverges from *this* spec — divergences discovered only once the code was
+written and exercised, so this document did not predict them. Recorded during
+the milestone-1 fix-wave-B cleanup pass.
+
+| This spec | As built | Why |
+|---|---|---|
+| §11 `export` command | Not implemented | `problem --json` (§17) already exposes the same data; a bulk exporter with no consumer would be speculative. |
+| §17 `problem --refresh` | Shipped as `problem --json` | Same intent — bypass the cached DB row and print the freshly scraped problem — under a different flag name. |
+| §3 `CodeRunClient.ListCompilers` | Dropped from the interface | Compilers arrive for free on `Problem.Languages` from `GetProblem`; a separate round trip was redundant. |
+| §10 `Submit(ctx, ref, compilerSlug, source []byte)` | Takes a source **path**, not `[]byte` | `Submit` reads and validates the file itself, before touching the browser, and hands the exact bytes it read back to the caller — so the CLI never has to read the file a second time to archive what was uploaded. |
+| §3 `GetProblem(ctx, ref) (*Problem, error)` | Returns `(*Problem, int, error)` | The extra `int` is the `problemContextId` discovered from the solution-template request while the page loads. `GetTemplate` and `Submit` need it, and returning it is cheaper than re-deriving it from another page load. |
+| `Selection.ProblemCount` | Never populated | Nothing that currently lists selections needs a count. The field stays in the schema and model for a consumer that doesn't exist yet, and round-trips as `0` until one does. |
+| §5.2 pagination via `?filters=` | Wrong | The `?filters=` blob is only what problem-detail links carry to restore list state on return; it is not what the site's own pager uses. The pager turns pages with plain `currentPage`/`pageSize`/`search` query parameters. See [`docs/coderun-research.md`](../../coderun-research.md) for the evidence and `internal/coderun/playwright/crawl.go` for the fix (the `extract.Filters`/`EncodeFilters`/`DecodeFilters` code this section originally justified has since been deleted as dead weight). |

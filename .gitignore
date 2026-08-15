@@ -21,3 +21,4 @@ solutions/
 
 # Tooling
 .tokensave/
+*.exe

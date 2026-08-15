@@ -6,7 +6,14 @@
 
 **Architecture:** Browser-primary. A single Playwright persistent browser context is the only thing that talks to CodeRun. HTML is pulled from the page and handed to a pure `extract` package (no Playwright types in its signatures), which makes every parser testable offline against real captured fixtures. Verdict JSON is read through the browser context's own `APIRequestContext`, so there is no second HTTP stack and no cookie copying. SQLite is the single source of truth; files under `solutions/` are write-only artifacts for humans.
 
-**Tech Stack:** Go 1.23+, `playwright-community/playwright-go`, `PuerkitoBio/goquery`, `spf13/cobra`, `modernc.org/sqlite` (pure Go, no cgo), `joho/godotenv`, stdlib `log/slog` and `testing`.
+**Tech Stack:** Go 1.23+, `mxschmitt/playwright-go`, `PuerkitoBio/goquery`, `spf13/cobra`, `modernc.org/sqlite` (pure Go, no cgo), `joho/godotenv`, stdlib `log/slog` and `testing`.
+
+> **Playwright import path.** Use `github.com/mxschmitt/playwright-go`, **not**
+> `github.com/playwright-community/playwright-go`. The project moved to the
+> `playwright-community` org, but as of v0.6201.0 the module's own `go.mod` still
+> declares `module github.com/mxschmitt/playwright-go`, so Go refuses to import it
+> under the community path. Verified against the module cache on 2026-08-14. This
+> looks like a stale dependency and is not one — do not "fix" it.
 
 **Source spec:** `docs/superpowers/specs/2026-08-14-coderun-agent-design.md`
 **Field research:** `docs/coderun-research.md`
@@ -312,7 +319,11 @@ git commit -m "feat(config): add environment configuration with sequential-only 
 
 ## Task 2: Capture real HTML fixtures
 
-Every parser in this plan is tested against **real** captured HTML, never hand-written approximations. Because CodeRun server-renders its pages and crawling needs no authentication, a plain HTTP client is enough to capture them.
+Every parser in this plan is tested against **real** captured HTML, never hand-written approximations.
+
+Capture goes through a headless browser, not `http.Get`. This was established empirically: a plain HTTP capture returns the problem page's shell (`problem-title`, the title text) but **not** its statement body, KaTeX, or `code-snippet` examples, which are rendered after hydration. Listings happen to survive a raw fetch; statements do not. Since the agent is browser-primary anyway, the capture tool uses the same mechanism the real crawler will.
+
+This task therefore pulls the Playwright dependency and the Chromium download forward from Task 10. Crawling still needs no authentication.
 
 **Files:**
 - Create: `cmd/capture-fixtures/main.go`
@@ -326,84 +337,145 @@ Every parser in this plan is tested against **real** captured HTML, never hand-w
   - `testdata/selection-2025-summer-common.html` — a selection's problem list
   - `testdata/problem-bridge-to-the-palace.html` — a problem page
 
-- [ ] **Step 1: Write the capture tool**
+- [ ] **Step 1: Add Playwright and install Chromium**
+
+```bash
+go get github.com/mxschmitt/playwright-go
+go run github.com/mxschmitt/playwright-go/cmd/playwright@latest install chromium --with-deps
+```
+
+The install downloads a browser build and takes a few minutes.
+
+Note the import path is `mxschmitt`, not `playwright-community` — see the Playwright
+import path note under Tech Stack. This is deliberate and verified.
+
+- [ ] **Step 2: Write the capture tool**
 
 Create `cmd/capture-fixtures/main.go`:
 
 ```go
-// Command capture-fixtures downloads real CodeRun pages into the extract
+// Command capture-fixtures saves real CodeRun pages into the extract
 // package's testdata directory.
 //
-// These pages are server-rendered and public, so no browser and no
-// authentication are required. Run this deliberately when refreshing
-// fixtures; it is not part of the test suite.
+// Capture runs through a headless browser because problem statements are
+// rendered after hydration: a plain HTTP GET returns the page shell without
+// the statement body, its KaTeX, or its examples. Listings would survive a
+// raw fetch, but using one mechanism for all three keeps the fixtures
+// consistent with what the real crawler sees.
+//
+// These pages are public; no authentication is involved. Run this
+// deliberately when refreshing fixtures — it is not part of the test suite.
 package main
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/playwright-community/playwright-go"
+
 	"coderun-agent/internal/config"
 )
 
-var targets = map[string]string{
-	"selections.html":                    "/selections?group=coderun-seasons",
-	"selection-2025-summer-common.html":  "/selections/2025-summer-common",
-	"problem-bridge-to-the-palace.html":  "/selections/2025-summer-common/problems/bridge-to-the-palace",
+type target struct {
+	name string
+	path string
+	// mustContain is a substring that proves the page finished rendering.
+	// Capturing a shell without it would silently produce useless fixtures.
+	mustContain string
+}
+
+var targets = []target{
+	{"selections.html", "/selections?group=coderun-seasons", "CodeRun Boost Challenge"},
+	{"selection-2025-summer-common.html", "/selections/2025-summer-common", "problem-list-item"},
+	{"problem-bridge-to-the-palace.html", "/selections/2025-summer-common/problems/bridge-to-the-palace", "Формат ввода"},
 }
 
 func main() {
-	outDir := filepath.Join("internal", "coderun", "extract", "testdata")
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, "mkdir:", err)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
-	}
-
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	for name, path := range targets {
-		// One second between requests. We are a guest on this site.
-		time.Sleep(time.Second)
-
-		body, err := fetch(client, config.BaseURL+path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
-			os.Exit(1)
-		}
-		dest := filepath.Join(outDir, name)
-		if err := os.WriteFile(dest, body, 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "write %s: %v\n", dest, err)
-			os.Exit(1)
-		}
-		fmt.Printf("saved %s (%d bytes)\n", dest, len(body))
 	}
 }
 
-func fetch(c *http.Client, url string) ([]byte, error) {
-	resp, err := c.Get(url)
+func run() error {
+	outDir := filepath.Join("internal", "coderun", "extract", "testdata")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+
+	pw, err := playwright.Run()
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("start playwright (did you run `playwright install chromium`?): %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	defer pw.Stop()
+
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(true),
+	})
+	if err != nil {
+		return fmt.Errorf("launch chromium: %w", err)
 	}
-	return io.ReadAll(resp.Body)
+	defer browser.Close()
+
+	page, err := browser.NewPage()
+	if err != nil {
+		return fmt.Errorf("open page: %w", err)
+	}
+
+	for _, t := range targets {
+		// One second between navigations. We are a guest on this site.
+		time.Sleep(time.Second)
+
+		html, err := capture(page, t)
+		if err != nil {
+			return err
+		}
+		dest := filepath.Join(outDir, t.name)
+		if err := os.WriteFile(dest, []byte(html), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dest, err)
+		}
+		fmt.Printf("saved %s (%d bytes)\n", dest, len(html))
+	}
+	return nil
+}
+
+func capture(page playwright.Page, t target) (string, error) {
+	if _, err := page.Goto(config.BaseURL+t.path, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateNetworkidle,
+	}); err != nil {
+		return "", fmt.Errorf("navigate %s: %w", t.path, err)
+	}
+
+	// Wait for the marker that proves rendering completed, rather than
+	// trusting networkidle alone.
+	if _, err := page.WaitForFunction(
+		fmt.Sprintf("() => document.documentElement.outerHTML.includes(%q)", t.mustContain),
+		nil,
+		playwright.PageWaitForFunctionOptions{Timeout: playwright.Float(20000)},
+	); err != nil {
+		return "", fmt.Errorf("%s never rendered %q: %w", t.name, t.mustContain, err)
+	}
+
+	html, err := page.Content()
+	if err != nil {
+		return "", fmt.Errorf("read content for %s: %w", t.name, err)
+	}
+	return html, nil
 }
 ```
 
-- [ ] **Step 2: Run the capture tool**
+- [ ] **Step 3: Run the capture tool**
 
 Run: `go run ./cmd/capture-fixtures`
 Expected: three `saved …` lines, each well over 20000 bytes.
 
-- [ ] **Step 3: Write the fixture sanity test**
+If a `never rendered` error appears, the page structure changed — report it rather than removing the check.
 
-This test guards the assumption the whole `extract` package rests on: that the content really is in the server-rendered HTML rather than injected by JavaScript. If it fails, the capture tool must be switched to a browser-based capture before continuing.
+- [ ] **Step 4: Write the fixture sanity test**
+
+This test guards the assumption the whole `extract` package rests on: that the fixtures contain fully rendered content. If it fails, the fixtures are shells and every parser built on them would match nothing.
 
 Create `internal/coderun/extract/fixtures_test.go`:
 
@@ -447,12 +519,12 @@ func TestFixturesAreServerRendered(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 5: Run the test to verify it passes**
 
 Run: `go test ./internal/coderun/extract/ -v`
-Expected: PASS. If `Формат ввода` is missing, stop and re-capture through Playwright before continuing.
+Expected: PASS. If `Формат ввода` is missing, the capture did not wait long enough — fix the capture tool, never the assertion.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 Fixtures are committed deliberately: they are the record of what the site actually looked like on this date.
 
@@ -832,8 +904,13 @@ func TestNormalizeKatexRemovesDuplication(t *testing.T) {
 func TestNormalizeKatexWithoutAnnotationDropsHiddenBranch(t *testing.T) {
 	// Defensive: if KaTeX ever renders without an annotation, we must still
 	// not emit the formula twice.
+	//
+	// The MathML branch carries real glyph text here (<mi>/<mo>), exactly as
+	// KaTeX emits it. That matters: with an empty <semantics> a no-op
+	// implementation would pass this test, making it useless as a guard.
 	html := `<div id="root"><span class="katex">` +
-		`<span class="katex-mathml"><math><semantics></semantics></math></span>` +
+		`<span class="katex-mathml"><math><semantics><mrow>` +
+		`<mi>x</mi><mo>+</mo><mi>y</mi></mrow></semantics></math></span>` +
 		`<span class="katex-html" aria-hidden="true">x+y</span></span></div>`
 
 	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(html))
@@ -841,7 +918,35 @@ func TestNormalizeKatexWithoutAnnotationDropsHiddenBranch(t *testing.T) {
 	NormalizeKatex(root)
 
 	if got := strings.TrimSpace(root.Text()); got != "x+y" {
-		t.Errorf("got %q, want %q", got, "x+y")
+		t.Errorf("got %q, want %q (a no-op implementation yields \"x+yx+y\")", got, "x+y")
+	}
+	if root.Find(".katex").Length() != 0 {
+		t.Error("a .katex node survived the no-annotation path")
+	}
+}
+
+func TestNormalizeKatexEscapesMarkupInTex(t *testing.T) {
+	// Strict inequalities are everywhere in competitive programming. The TeX
+	// source contains a literal '<', which must never be spliced into an HTML
+	// string and re-parsed as a tag.
+	//
+	// The '<' must be followed immediately by a letter, with no space. HTML5
+	// only enters tag-open state when '<' is directly followed by an ASCII
+	// letter, so "0 < x" survives an unescaped splice by luck while "0<x"
+	// does not. Only the no-space form discriminates a correct implementation
+	// from a broken one.
+	html := `<div id="root"><span class="katex">` +
+		`<span class="katex-mathml"><math><semantics>` +
+		`<annotation encoding="application/x-tex">0&lt;x&lt;10</annotation>` +
+		`</semantics></math></span>` +
+		`<span class="katex-html" aria-hidden="true">0&lt;x&lt;10</span></span></div>`
+
+	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(html))
+	root := doc.Find("#root")
+	NormalizeKatex(root)
+
+	if got := strings.TrimSpace(root.Text()); got != "$0<x<10$" {
+		t.Errorf("got %q, want %q — TeX was re-parsed as markup", got, "$0<x<10$")
 	}
 }
 
@@ -881,6 +986,7 @@ Create `internal/coderun/extract/katex.go`:
 package extract
 
 import (
+	"html"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -893,19 +999,28 @@ import (
 // once as styled HTML for sighted users — so reading text without this step
 // duplicates every formula. The TeX source is recovered from the
 // <annotation encoding="application/x-tex"> node in the MathML branch.
+//
+// Recovered text is HTML-escaped before being spliced back in. goquery's
+// Text() returns decoded text, and ReplaceWithHtml re-parses its argument as
+// markup, so an unescaped strict inequality like "0 < x < 10" would be read
+// as an opening tag and silently destroy the constraint.
 func NormalizeKatex(sel *goquery.Selection) {
 	sel.Find(".katex").Each(func(_ int, k *goquery.Selection) {
 		tex := strings.TrimSpace(k.Find(`annotation[encoding="application/x-tex"]`).First().Text())
 
 		if tex == "" {
-			// No annotation to recover. Drop the MathML branch so at least the
-			// visible rendering is not emitted twice.
+			// No annotation to recover. Drop the MathML branch and unwrap the
+			// node, so the visible rendering survives exactly once and no
+			// .katex element is left behind.
 			k.Find(".katex-mathml").Remove()
+			visible := strings.TrimSpace(k.Text())
+			k.ReplaceWithHtml("<span>" + html.EscapeString(visible) + "</span>")
 			return
 		}
 		// Collapse internal whitespace: annotations arrive pretty-printed.
+		// TeX is whitespace-insensitive in maths mode, so this is safe.
 		tex = strings.Join(strings.Fields(tex), " ")
-		k.ReplaceWithHtml("<span>$" + tex + "$</span>")
+		k.ReplaceWithHtml("<span>$" + html.EscapeString(tex) + "$</span>")
 	})
 }
 ```
@@ -913,7 +1028,12 @@ func NormalizeKatex(sel *goquery.Selection) {
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `go test ./internal/coderun/extract/ -run Katex -v`
-Expected: PASS, 4 tests
+Expected: PASS, 5 tests
+
+Before committing, confirm `TestNormalizeKatexEscapesMarkupInTex` is a real guard:
+temporarily drop the `html.EscapeString` call and re-run it. It must FAIL. Restore
+the call afterwards. A test that passes against the broken implementation is not
+coverage.
 
 - [ ] **Step 6: Commit**
 
@@ -1194,6 +1314,71 @@ func TestParseProblemList(t *testing.T) {
 	}
 }
 
+func TestParseProblemListReadsDifficulty(t *testing.T) {
+	// Without this, a stub returning DifficultyUnknown for every row passes
+	// the whole suite. Difficulty is derived by slicing row text after the
+	// title, which is the most fragile extraction in this file.
+	probs, _, err := ParseProblemList(
+		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range probs {
+		if p.Difficulty.Raw == "" {
+			t.Errorf("problem %q has an empty difficulty label — rowDifficulty is not finding it",
+				p.Ref.ProblemSlug)
+		}
+	}
+	if probs[0].Difficulty.Level == coderun.DifficultyUnknown {
+		t.Errorf("problem %q difficulty %q did not map to a known level",
+			probs[0].Ref.ProblemSlug, probs[0].Difficulty.Raw)
+	}
+}
+
+func TestParseProblemListHandlesNonBreakingSpaces(t *testing.T) {
+	// "В двоичном лесу" carries a U+00A0 after the single-letter preposition,
+	// which is ordinary Russian typography rather than an edge case. Go's
+	// regexp \s does not match U+00A0 while strings.Fields does, so an
+	// un-normalised pipeline yields a title that cannot be found in its own
+	// row text — and the difficulty silently disappears.
+	probs, _, err := ParseProblemList(
+		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *coderun.ProblemSummary
+	for i := range probs {
+		if probs[i].Ref.ProblemSlug == "binary-forest" {
+			found = &probs[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("binary-forest not found; re-capture the fixture if the selection changed")
+	}
+	if found.Title != normalizeSpace(found.Title) {
+		t.Errorf("Title %q is not whitespace-normalised (likely a stray U+00A0)", found.Title)
+	}
+	if found.Difficulty.Raw == "" {
+		t.Error("difficulty was lost for a title containing a non-breaking space")
+	}
+}
+
+func TestCountPagesWithoutPagerIsOne(t *testing.T) {
+	// A selection short enough to fit on one page has no pager at all. That
+	// must read as exactly one page, not zero.
+	_, pages, err := ParseProblemList(
+		`<div data-testid="problem-list-item">`+
+			`<span role="graphics-symbol" class="ProblemStatus_type_solved__x"></span>`+
+			`<a href="/selections/s/problems/only-one">1. Единственная Средняя</a></div>`, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages != 1 {
+		t.Errorf("pages = %d, want 1 when no pager is present", pages)
+	}
+}
+
 func TestParseProblemListStripsFiltersFromSlug(t *testing.T) {
 	probs, _, err := ParseProblemList(
 		loadFixture(t, "selection-2025-summer-common.html"), "2025-summer-common")
@@ -1318,7 +1503,12 @@ func ParseProblemList(html, selectionSlug string) ([]coderun.ProblemSummary, int
 		}
 		slug := m[1]
 
-		number, title := 0, strings.TrimSpace(a.Text())
+		// Normalise before matching. Russian typography puts non-breaking
+		// spaces (U+00A0) after single-letter prepositions — "В двоичном
+		// лесу" — and Go's regexp \s is ASCII-only while strings.Fields and
+		// strings.TrimSpace are Unicode-aware. Mixing the two silently
+		// produces titles that no longer match the text they came from.
+		number, title := 0, normalizeSpace(a.Text())
 		if nm := numberPrefix.FindStringSubmatch(title); nm != nil {
 			number, _ = strconv.Atoi(nm[1])
 			title = strings.TrimSpace(nm[2])
@@ -1345,23 +1535,51 @@ func ParseProblemList(html, selectionSlug string) ([]coderun.ProblemSummary, int
 	return out, countPages(doc), nil
 }
 
+// normalizeSpace collapses every run of Unicode whitespace — including the
+// non-breaking spaces CodeRun's Russian titles are full of — to a single
+// ASCII space. Both sides of any text comparison in this file must go through
+// it, or a title containing U+00A0 will fail to match the row text it was
+// extracted from.
+func normalizeSpace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // rowDifficulty recovers the difficulty label, which sits in the row's text
 // after the title and has no dedicated test id.
 func rowDifficulty(row *goquery.Selection, title string) string {
-	text := strings.Join(strings.Fields(row.Text()), " ")
-	if i := strings.LastIndex(text, title); i >= 0 {
-		return strings.TrimSpace(text[i+len(title):])
+	needle := normalizeSpace(title)
+	if needle == "" {
+		return ""
+	}
+	text := normalizeSpace(row.Text())
+	if i := strings.LastIndex(text, needle); i >= 0 {
+		return strings.TrimSpace(text[i+len(needle):])
 	}
 	return ""
 }
 
-// countPages reads the highest numeric label in the pager. A single-page list
-// has no pager, which correctly yields 1.
+// pageLinkLabel matches the pager's per-page control, whose accessible name is
+// "К странице <n>". Matching the ARIA label rather than "any number inside any
+// <nav>" avoids picking up breadcrumbs or unrelated navigation — the page
+// carries both a Breadcrumbs nav and a Pagination nav.
+//
+// This is locale-dependent, which is a real weakness. It is accepted because
+// the alternative is a structural guess that fails silently: an
+// under-counted pager means whole pages of problems are never crawled and no
+// error is raised. ListProblems carries a second guard for that case.
+var pageLinkLabel = regexp.MustCompile(`^К странице (\d+)$`)
+
+// countPages reads the highest page number offered by the pager. A single-page
+// list has no pager, which correctly yields 1.
 func countPages(doc *goquery.Document) int {
 	max := 1
-	doc.Find(`nav a, nav button`).Each(func(_ int, e *goquery.Selection) {
-		n, err := strconv.Atoi(strings.TrimSpace(e.Text()))
-		if err == nil && n > max {
+	doc.Find(`[aria-label]`).Each(func(_ int, e *goquery.Selection) {
+		label, _ := e.Attr("aria-label")
+		m := pageLinkLabel.FindStringSubmatch(strings.TrimSpace(label))
+		if m == nil {
+			return
+		}
+		if n, err := strconv.Atoi(m[1]); err == nil && n > max {
 			max = n
 		}
 	})
@@ -1501,6 +1719,23 @@ func TestParseProblemKeepsUnknownSections(t *testing.T) {
 	}
 }
 
+func TestParseProblemDoesNotDuplicateExamplesIntoSections(t *testing.T) {
+	// The examples block has its own <h2>Примеры</h2>. Left unignored, that
+	// heading falls into the unrecognised-section branch and the whole block
+	// is collected as run-together text, duplicating Problem.Examples inside
+	// a field meant for genuine unrecognised prose.
+	p := loadProblem(t)
+
+	if _, ok := p.Sections["примеры"]; ok {
+		t.Error("Sections contains the examples block; it belongs only in Problem.Examples")
+	}
+	for key, body := range p.Sections {
+		if strings.Contains(body, "Ввод") && strings.Contains(body, "Вывод") {
+			t.Errorf("Sections[%q] carries example data: %.80q", key, body)
+		}
+	}
+}
+
 func TestParseProblemCompilers(t *testing.T) {
 	p := loadProblem(t)
 
@@ -1558,6 +1793,20 @@ var sectionHeadings = map[string]string{
 	"ограничения":   "constraints",
 	"примечание":    "notes",
 }
+
+// ignoredHeadings name sections whose content is captured structurally
+// elsewhere. The examples block sits under its own <h2>Примеры</h2>, and its
+// body is already parsed into Problem.Examples from the code-snippet blocks.
+// Without this, that heading falls through to the unrecognised-section branch
+// and the whole examples block is slurped into Sections as run-together text
+// ("Пример 1Ввод5\n2 0 -3 3 6\nВывод2…") — a garbled duplicate inside a field
+// documented as holding genuine unrecognised prose.
+var ignoredHeadings = map[string]bool{
+	"примеры": true,
+}
+
+// ignoredSection is the sentinel section key whose buffered body is discarded.
+const ignoredSection = "\x00ignored"
 
 func ParseProblem(html string, ref coderun.ProblemRef) (*coderun.Problem, error) {
 	doc, err := parse(html)
@@ -1636,7 +1885,7 @@ func assignSections(container *goquery.Selection, p *coderun.Problem) {
 	flush := func() {
 		text := clean(strings.Join(buf, "\n"))
 		buf = buf[:0]
-		if text == "" {
+		if text == "" || current == ignoredSection {
 			return
 		}
 		switch current {
@@ -1665,10 +1914,15 @@ func walkForSections(node *goquery.Selection, current *string, buf *[]string, fl
 	if goquery.NodeName(node) == "h2" {
 		flush()
 		label := strings.ToLower(strings.TrimSpace(node.Text()))
-		if key, ok := sectionHeadings[label]; ok {
-			*current = key
-		} else {
-			*current = label // preserved verbatim in Sections
+		switch {
+		case ignoredHeadings[label]:
+			*current = ignoredSection
+		default:
+			if key, ok := sectionHeadings[label]; ok {
+				*current = key
+			} else {
+				*current = label // preserved verbatim in Sections
+			}
 		}
 		return
 	}
@@ -1684,9 +1938,19 @@ func walkForSections(node *goquery.Selection, current *string, buf *[]string, fl
 }
 
 // parseExamples reads the code-snippet blocks, which alternate Ввод / Вывод.
+//
+// Each snippet is a header element carrying the caption plus a <pre> holding
+// the data. Read the <pre> directly: taking the whole snippet's text runs the
+// caption straight into the content with no separator ("Ввод5\n2 0 -3 3 6"),
+// so there is no newline for a label-stripper to find.
 func parseExamples(doc *goquery.Document) []coderun.Example {
 	var blocks []string
 	doc.Find(`[data-testid="code-snippet"]`).Each(func(_ int, s *goquery.Selection) {
+		if pre := s.Find("pre").First(); pre.Length() > 0 {
+			blocks = append(blocks, strings.Trim(pre.Text(), "\n"))
+			return
+		}
+		// Fallback for a snippet rendered without a <pre>.
 		blocks = append(blocks, stripSnippetLabel(s.Text()))
 	})
 
@@ -1709,17 +1973,27 @@ func stripSnippetLabel(s string) string {
 	return strings.TrimRight(s, "\n")
 }
 
-// parseCompilers reads the language listbox. The option's id attribute IS the
-// compilerSlug — it is never derived from the visible label.
+// parseCompilers reads the language picker, which is a native <select> in the
+// server-rendered page. The option's value attribute IS the compilerSlug — it
+// is never derived from the visible label, because JavaScript's slug is
+// nodejs_20_make.
+//
+// A hidden placeholder option with an empty value is present and skipped.
+//
+// Version is left empty here. The static <select> carries only the language
+// name ("JavaScript"); the versioned label ("JavaScript 20.14.0") appears only
+// in the rich dropdown the client renders once opened, which is not worth a
+// browser interaction for a cosmetic field.
 func parseCompilers(doc *goquery.Document) []coderun.Compiler {
 	var out []coderun.Compiler
-	doc.Find(`[role="listbox"] [role="option"]`).Each(func(_ int, o *goquery.Selection) {
-		slug, ok := o.Attr("id")
+	doc.Find(`select option`).Each(func(_ int, o *goquery.Selection) {
+		slug, ok := o.Attr("value")
 		if !ok || slug == "" {
 			return
 		}
-		label := strings.Join(strings.Fields(o.Text()), " ")
+		label := normalizeSpace(o.Text())
 		title, version := label, ""
+		// Split a trailing version if the label happens to carry one.
 		if i := strings.LastIndex(label, " "); i > 0 {
 			candidate := label[i+1:]
 			if len(candidate) > 0 && candidate[0] >= '0' && candidate[0] <= '9' {
@@ -1747,7 +2021,10 @@ func clean(s string) string {
 Run: `go test ./internal/coderun/extract/ -run ParseProblem -v`
 Expected: PASS, 6 tests.
 
-If `TestParseProblemCompilers` fails with zero compilers, the listbox is likely rendered only after the dropdown is opened. In that case, move compiler discovery to Task 12 (which drives a live browser) and mark this test `t.Skip` with a comment pointing at that task — do not delete the assertion.
+Two things this task's tests pinned down against the real page, already reflected in the code above:
+
+- Compilers come from a native `<select>`, not an ARIA listbox. `[role="option"]` appears **zero** times in the captured page — the rich listbox is built client-side only after the dropdown is opened. The `<select>` is present server-side with `value="python_make"` style options, which is strictly better: no interaction needed.
+- Snippet captions are a sibling element, not a first line. The snippet's own text reads `"Ввод5\n2 0 -3 3 6"` with no separator between caption and content, so reading the inner `<pre>` is the only reliable route.
 
 - [ ] **Step 5: Run the whole extract suite**
 
@@ -2452,12 +2729,17 @@ git commit -m "feat(storage): write immutable per-attempt solution artifacts"
   - `pwclient.ErrChallenge` sentinel error
   - `pwclient.DetectChallenge(url, html string) error` — pure, unit-tested
 
-- [ ] **Step 1: Add playwright-go**
+- [ ] **Step 1: Confirm Playwright is available**
+
+The dependency and the Chromium build were installed in Task 2. Verify rather than reinstall:
 
 ```bash
-go get github.com/playwright-community/playwright-go
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium --with-deps
+go list -m github.com/mxschmitt/playwright-go
 ```
+
+If it is missing, run `go get github.com/mxschmitt/playwright-go` and
+`go run github.com/mxschmitt/playwright-go/cmd/playwright@latest install chromium --with-deps`.
+The `mxschmitt` path is correct — see the Playwright import path note under Tech Stack.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -2698,7 +2980,11 @@ Create `internal/coderun/playwright/auth_test.go`:
 ```go
 package pwclient
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"testing"
+)
 
 func TestIsLoggedInFalseWhenLoginControlPresent(t *testing.T) {
 	html := `<html><body><a data-testid="log-in" href="https://passport.yandex.ru/auth">Войти</a></body></html>`
@@ -2708,16 +2994,43 @@ func TestIsLoggedInFalseWhenLoginControlPresent(t *testing.T) {
 }
 
 func TestIsLoggedInTrueWhenLoginControlAbsent(t *testing.T) {
-	html := `<html><body><button aria-label="Меню профиля"></button><div data-testid="problem-title">2. X</div></body></html>`
+	html := `<html><body><script id="__NEXT_DATA__">{}</script>` +
+		`<button aria-label="Меню профиля"></button>` +
+		`<div data-testid="problem-title">2. X</div></body></html>`
 	if !IsLoggedIn(html) {
-		t.Error("a page without the log-in control should count as authenticated")
+		t.Error("a CodeRun page without the log-in control should count as authenticated")
 	}
 }
 
 func TestIsLoggedInFalseOnEmptyPage(t *testing.T) {
-	// An empty or error page must never be read as a valid session.
+	// An empty page must never be read as a valid session.
 	if IsLoggedIn("") {
 		t.Error("empty HTML must not count as authenticated")
+	}
+}
+
+func TestIsLoggedInFalseOnErrorPage(t *testing.T) {
+	// A gateway error page lacks the log-in control purely by accident.
+	// Absence-only detection would read this as a live session and let the
+	// agent march on against a site that is not actually serving us.
+	if IsLoggedIn(`<html><body><h1>502 Bad Gateway</h1></body></html>`) {
+		t.Error("an error page must not count as authenticated")
+	}
+}
+
+func TestIsChallengeUsesSentinel(t *testing.T) {
+	// Goto wraps ErrChallenge with %w. Matching on the sentinel rather than on
+	// message text means rewording the message cannot silently change
+	// behaviour.
+	wrapped := fmt.Errorf("navigate to /selections: %w", ErrChallenge)
+	if !isChallenge(wrapped) {
+		t.Error("isChallenge must recognise a wrapped ErrChallenge")
+	}
+	if isChallenge(errors.New("coderun presented a challenge")) {
+		t.Error("isChallenge must not match on message text alone")
+	}
+	if isChallenge(nil) {
+		t.Error("isChallenge(nil) must be false")
 	}
 }
 ```
@@ -2736,6 +3049,7 @@ package pwclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -2746,10 +3060,15 @@ import (
 const loginMarker = `data-testid="log-in"`
 
 // IsLoggedIn reports whether a CodeRun page was rendered for an authenticated
-// user. Absence of the log-in control is the signal; an empty page is never
-// treated as logged in.
+// user.
+//
+// Absence of the log-in control is the signal, but absence alone is not
+// enough: a gateway error page, a redirect stub or an empty body all lack that
+// control purely by accident and would otherwise read as a valid session. So
+// the page must first be recognisable as a CodeRun page at all. The Next.js
+// data blob is the cheapest positive marker that is not locale-dependent.
 func IsLoggedIn(html string) bool {
-	if strings.TrimSpace(html) == "" {
+	if !strings.Contains(html, "__NEXT_DATA__") {
 		return false
 	}
 	return !strings.Contains(html, loginMarker)
@@ -2769,8 +3088,11 @@ func (b *Browser) AuthStatus(ctx context.Context) (bool, error) {
 	return IsLoggedIn(html), nil
 }
 
+// isChallenge uses the sentinel rather than matching error text. Goto wraps
+// ErrChallenge with %w precisely so this works; string matching would break
+// silently the moment the sentinel's message is reworded.
 func isChallenge(err error) bool {
-	return err != nil && strings.Contains(err.Error(), ErrChallenge.Error())
+	return errors.Is(err, ErrChallenge)
 }
 
 // AwaitLogin opens the Yandex login page and waits for the operator to finish.
@@ -2831,6 +3153,7 @@ Wires the browser to the pure parsers, adds pagination, and captures `ContextID`
 **Files:**
 - Create: `internal/coderun/playwright/crawl.go`, `internal/coderun/client.go`
 - Test: `internal/coderun/playwright/crawl_test.go`
+- Imports: `crawl.go` needs `coderun-agent/internal/config` (for `config.BaseURL`), `coderun-agent/internal/coderun`, `coderun-agent/internal/coderun/extract`, `github.com/playwright-community/playwright-go`, plus `context`, `encoding/json`, `fmt`, `log/slog`, `net/url`, `strconv`, `sync`
 
 **Interfaces:**
 - Consumes: `Browser.Goto` (Task 10), all `extract` parsers (Tasks 3–7)
@@ -3017,6 +3340,16 @@ func (b *Browser) ListProblems(ctx context.Context, selectionSlug string) ([]cod
 		if page == 1 {
 			totalPages = pages
 			slog.Info("problem list", "selection", selectionSlug, "pages", totalPages)
+
+			// Guard against a silently missed pager. Page size is 20, so a
+			// "single page" holding exactly 20 problems is far more likely to
+			// be an undetected page 1 of N than a selection that happens to
+			// end on the boundary. Under-crawling produces no error of its
+			// own — whole pages simply never appear — so say so loudly.
+			if totalPages == 1 && len(probs) >= extract.DefaultFilters(1).PageSize {
+				slog.Warn("selection reports one page but is exactly full; the pager may not have been detected",
+					"selection", selectionSlug, "problems", len(probs))
+			}
 		}
 
 		added := 0
@@ -3118,7 +3451,7 @@ func (b *Browser) apiGet(ctx context.Context, path string) ([]byte, error) {
 	default:
 	}
 
-	resp, err := b.Ctx.Request().Get(configBaseURL() + path)
+	resp, err := b.Ctx.Request().Get(config.BaseURL + path)
 	if err != nil {
 		return nil, fmt.Errorf("api GET %s: %w", path, err)
 	}
@@ -3131,16 +3464,7 @@ func (b *Browser) apiGet(ctx context.Context, path string) ([]byte, error) {
 }
 ```
 
-Add `internal/coderun/playwright/base.go`:
-
-```go
-package pwclient
-
-import "coderun-agent/internal/config"
-
-// configBaseURL keeps the origin in exactly one place.
-func configBaseURL() string { return config.BaseURL }
-```
+Note the import list for `crawl.go` must include `coderun-agent/internal/config` for the `config.BaseURL` reference in `apiGet`.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
@@ -3157,7 +3481,7 @@ If `b.Ctx.Request()` does not exist in the installed playwright-go version, chec
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/coderun/client.go internal/coderun/playwright/crawl.go internal/coderun/playwright/base.go internal/coderun/playwright/crawl_test.go
+git add internal/coderun/client.go internal/coderun/playwright/crawl.go internal/coderun/playwright/crawl_test.go
 git commit -m "feat(crawl): list selections, paginate problems, extract statements and templates"
 ```
 
@@ -3411,6 +3735,7 @@ Create `internal/coderun/playwright/verdict_test.go`:
 package pwclient
 
 import (
+	"strings"
 	"testing"
 
 	"coderun-agent/internal/coderun"
@@ -3510,8 +3835,51 @@ func TestIsAcceptedIsClosedOnSuccessOnly(t *testing.T) {
 
 func TestParseSubmissionDetailSurfacesAPIError(t *testing.T) {
 	body := []byte(`{"result":null,"error":{"statusCode":404,"code":"not-found","message":"nope"}}`)
-	if _, _, err := ParseSubmissionDetail(body); err == nil {
+
+	_, _, err := ParseSubmissionDetail(body)
+	if err == nil {
 		t.Fatal("expected an error when the API returns one")
+	}
+	// Asserting only that err != nil would pass against an implementation that
+	// never reads the error object at all and simply reports "no result".
+	// Require the API's own fields to reach the caller, since they are what
+	// makes a failure diagnosable.
+	for _, want := range []string{"nope", "not-found", "404"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not surface %q from the API error object", err, want)
+		}
+	}
+}
+
+func TestParseSubmissionDetailPicksFirstGenuinelyFailedTest(t *testing.T) {
+	// Three sample tests: one passed, one has not run yet (empty verdict), one
+	// failed. The artifact links must come from the failed one. Picking the
+	// wrong test would put one test's expected output beside another's actual
+	// — silently misleading rather than obviously broken.
+	body := []byte(`{"result":{
+	 "globalId":"g","verdict":"WRONG_ANSWER","status":"FINISHED",
+	 "openTests":{"totalTests":3,"tests":[
+	   {"testNumber":1,"isSample":true,"verdict":"OK",
+	    "input":{"link":"https://s3/in1"},"output":{"link":"https://s3/out1"},"answer":{"link":"https://s3/ans1"}},
+	   {"testNumber":2,"isSample":true,"verdict":"",
+	    "input":{"link":"https://s3/in2"},"output":{"link":"https://s3/out2"},"answer":{"link":"https://s3/ans2"}},
+	   {"testNumber":3,"isSample":true,"verdict":"WRONG_ANSWER",
+	    "input":{"link":"https://s3/in3"},"output":{"link":"https://s3/out3"},"answer":{"link":"https://s3/ans3"}}]},
+	 "hiddenTests":{"totalTests":0},
+	 "runtimeLimits":{"timeLimitMillis":1000,"memoryLimitBytes":1}},"error":null}`)
+
+	sub, links, err := ParseSubmissionDetail(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sub.OpenTests) != 3 {
+		t.Fatalf("got %d open tests, want 3", len(sub.OpenTests))
+	}
+	if len(links) != 3 {
+		t.Fatalf("got %d links, want 3", len(links))
+	}
+	if links[0] != "https://s3/in3" || links[1] != "https://s3/out3" || links[2] != "https://s3/ans3" {
+		t.Errorf("links came from the wrong test: %v", links)
 	}
 }
 ```
@@ -3846,6 +4214,43 @@ func TestResolveCompilerJavaScriptMapsToNodeSlug(t *testing.T) {
 	}
 }
 
+func TestResolveCompilerRejectsAmbiguousPrefix(t *testing.T) {
+	// "jav" prefixes both Java and JavaScript. Returning the first match would
+	// submit Java source as JavaScript or vice versa — a wasted submission on
+	// a live contest platform, with nothing in the output to say a fuzzy match
+	// occurred.
+	ambiguous := []coderun.Compiler{
+		{Slug: "java_make", Title: "Java"},
+		{Slug: "nodejs_20_make", Title: "JavaScript"},
+	}
+	_, err := resolveCompiler("jav", ambiguous)
+	if err == nil {
+		t.Fatal("expected an error for an ambiguous prefix, not a silent pick")
+	}
+	for _, want := range []string{"java_make", "nodejs_20_make"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should list candidate %q", err, want)
+		}
+	}
+}
+
+func TestResolveCompilerExactTitleBeatsPrefix(t *testing.T) {
+	// "C" is an exact title and also a prefix of "C#" and "C++". The exact
+	// match must win, or asking for C would be reported as ambiguous.
+	cLike := []coderun.Compiler{
+		{Slug: "c_make", Title: "C"},
+		{Slug: "csharp_make", Title: "C#"},
+		{Slug: "cpp_make", Title: "C++"},
+	}
+	got, err := resolveCompiler("c", cLike)
+	if err != nil {
+		t.Fatalf("exact title match should win over prefix ambiguity: %v", err)
+	}
+	if got != "c_make" {
+		t.Errorf("got %q, want c_make", got)
+	}
+}
+
 func TestResolveCompilerUnknownListsOptions(t *testing.T) {
 	_, err := resolveCompiler("brainfuck", testCompilers)
 	if err == nil {
@@ -3965,10 +4370,29 @@ func resolveCompiler(name string, compilers []coderun.Compiler) (string, error) 
 			return c.Slug, nil
 		}
 	}
-	// Last resort: a prefix match, so "c++" finds "C++ 14.1.0".
-	for _, c := range compilers {
-		if strings.HasPrefix(strings.ToLower(c.Title), want) && want != "" {
-			return c.Slug, nil
+	// Last resort: a prefix match, so "pyth" finds "Python".
+	//
+	// An ambiguous prefix is an error, never a silent pick. "jav" prefixes both
+	// Java and JavaScript, and quietly choosing whichever the site happened to
+	// list first would submit the wrong language — which still counts as a real
+	// submission against the user's record.
+	if want != "" {
+		var matches []coderun.Compiler
+		for _, c := range compilers {
+			if strings.HasPrefix(strings.ToLower(c.Title), want) {
+				matches = append(matches, c)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0].Slug, nil
+		}
+		if len(matches) > 1 {
+			var names []string
+			for _, c := range matches {
+				names = append(names, fmt.Sprintf("%s (%s)", c.Slug, c.Title))
+			}
+			return "", fmt.Errorf("language %q is ambiguous; did you mean one of: %s",
+				name, strings.Join(names, ", "))
 		}
 	}
 
@@ -4204,6 +4628,17 @@ func submitCmd() *cobra.Command {
 					return err
 				}
 
+				// Read the source BEFORE submitting. Submitting is the point of
+				// no return: it takes an action on a live platform that counts
+				// against the user's record. Anything that can fail must fail
+				// before it, so that nothing sits between the submission and the
+				// record of that submission.
+				source, err := readFile(file)
+				if err != nil {
+					return err
+				}
+				ext := strings.TrimPrefix(filepath.Ext(file), ".")
+
 				fmt.Printf("[2/4] Submitting %s as %s...\n", file, slug)
 				sub, err := b.Submit(ctx, ref, slug, file)
 				if err != nil {
@@ -4211,29 +4646,41 @@ func submitCmd() *cobra.Command {
 				}
 				fmt.Printf("      submission %s\n", sub.GlobalID)
 
+				// The submission now exists on CodeRun's servers. Every exit
+				// path from here must leave the user able to find it again.
 				attempt, err := st.NextAttempt(ctx, ref.SelectionSlug, ref.ProblemSlug)
 				if err != nil {
-					return err
+					// No attempt number means no artifact filename. The globalId
+					// goes into the error text, because it is the only handle
+					// that can recover this submission.
+					return fmt.Errorf("submission %s was accepted by CodeRun but no attempt number could be reserved: %w",
+						sub.GlobalID, err)
+				}
+
+				record := func(verdict string) error {
+					return storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
+						Language:     slug,
+						SubmissionID: sub.GlobalID,
+						Verdict:      verdict,
+					})
 				}
 
 				fmt.Println("[3/4] Waiting for the verdict...")
-				final, err := b.AwaitVerdict(ctx, sub.GlobalID, cfg.PollInterval, cfg.SubmissionTimeout)
-				if err != nil {
-					return err
+				final, verdictErr := b.AwaitVerdict(ctx, sub.GlobalID, cfg.PollInterval, cfg.SubmissionTimeout)
+				if verdictErr != nil {
+					// Record what we know before surfacing the failure. The
+					// globalId is the only handle that can recover this
+					// submission later.
+					if err := record("UNKNOWN"); err != nil {
+						return fmt.Errorf("could not read the verdict (%v), and recording the attempt also failed: %w", verdictErr, err)
+					}
+					return fmt.Errorf("submission %s saved as attempt %d, but the verdict could not be read: %w",
+						sub.GlobalID, attempt, verdictErr)
 				}
 				final.Ref = ref
 
 				fmt.Println("[4/4] Recording the attempt...")
-				source, err := readFile(file)
-				if err != nil {
-					return err
-				}
-				ext := strings.TrimPrefix(filepath.Ext(file), ".")
-				if err := storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
-					Language:     slug,
-					SubmissionID: final.GlobalID,
-					Verdict:      final.Verdict,
-				}); err != nil {
+				if err := record(final.Verdict); err != nil {
 					return err
 				}
 
