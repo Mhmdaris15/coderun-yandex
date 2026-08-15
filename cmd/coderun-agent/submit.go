@@ -45,6 +45,17 @@ func submitCmd() *cobra.Command {
 					return err
 				}
 
+				// Read the source BEFORE submitting. Submitting is the point of
+				// no return: it takes an action on a live platform that counts
+				// against the user's record. Anything that can fail must fail
+				// before it, so that nothing sits between the submission and the
+				// record of that submission.
+				source, err := readFile(file)
+				if err != nil {
+					return err
+				}
+				ext := strings.TrimPrefix(filepath.Ext(file), ".")
+
 				fmt.Printf("[2/4] Submitting %s as %s...\n", file, slug)
 				sub, err := b.Submit(ctx, ref, slug, file)
 				if err != nil {
@@ -52,21 +63,16 @@ func submitCmd() *cobra.Command {
 				}
 				fmt.Printf("      submission %s\n", sub.GlobalID)
 
+				// The submission now exists on CodeRun's servers. Every exit
+				// path from here must leave the user able to find it again.
 				attempt, err := st.NextAttempt(ctx, ref.SelectionSlug, ref.ProblemSlug)
 				if err != nil {
-					return err
+					// No attempt number means no artifact filename. The globalId
+					// goes into the error text, because it is the only handle
+					// that can recover this submission.
+					return fmt.Errorf("submission %s was accepted by CodeRun but no attempt number could be reserved: %w",
+						sub.GlobalID, err)
 				}
-
-				// From here the submission exists on CodeRun's servers and the
-				// attempt number is durably spent. Every exit path below must
-				// therefore record the attempt, or the submission becomes
-				// unfindable from local state while still counting against the
-				// user's record.
-				source, err := readFile(file)
-				if err != nil {
-					return err
-				}
-				ext := strings.TrimPrefix(filepath.Ext(file), ".")
 
 				record := func(verdict string) error {
 					return storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
