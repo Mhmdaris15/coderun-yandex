@@ -1,0 +1,117 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"coderun-agent/internal/coderun"
+	pwclient "coderun-agent/internal/coderun/playwright"
+	"coderun-agent/internal/config"
+	"coderun-agent/internal/storage"
+)
+
+func submitCmd() *cobra.Command {
+	var file, lang string
+
+	cmd := &cobra.Command{
+		Use:   "submit <selection> <slug>",
+		Short: "Submit a source file and wait for the verdict",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return withBrowser(false, func(ctx context.Context, cfg *config.Config, b *pwclient.Browser, st *storage.Store) error {
+				ref := coderun.ProblemRef{SelectionSlug: args[0], ProblemSlug: args[1]}
+
+				fmt.Println("[1/4] Fetching problem...")
+				p, contextID, err := b.GetProblem(ctx, ref)
+				if err != nil {
+					return err
+				}
+				ref.ContextID = contextID
+				if err := st.SaveProblem(ctx, p); err != nil {
+					return err
+				}
+				if contextID != 0 {
+					if err := st.SetContextID(ctx, ref); err != nil {
+						return err
+					}
+				}
+
+				slug, err := resolveCompiler(lang, p.Languages)
+				if err != nil {
+					return err
+				}
+
+				fmt.Printf("[2/4] Submitting %s as %s...\n", file, slug)
+				sub, err := b.Submit(ctx, ref, slug, file)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("      submission %s\n", sub.GlobalID)
+
+				attempt, err := st.NextAttempt(ctx, ref.SelectionSlug, ref.ProblemSlug)
+				if err != nil {
+					return err
+				}
+
+				fmt.Println("[3/4] Waiting for the verdict...")
+				final, err := b.AwaitVerdict(ctx, sub.GlobalID, cfg.PollInterval, cfg.SubmissionTimeout)
+				if err != nil {
+					return err
+				}
+				final.Ref = ref
+
+				fmt.Println("[4/4] Recording the attempt...")
+				source, err := readFile(file)
+				if err != nil {
+					return err
+				}
+				ext := strings.TrimPrefix(filepath.Ext(file), ".")
+				if err := storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
+					Language:     slug,
+					SubmissionID: final.GlobalID,
+					Verdict:      final.Verdict,
+				}); err != nil {
+					return err
+				}
+
+				printVerdict(final)
+				if !coderun.IsAccepted(final.Verdict) {
+					return fmt.Errorf("not accepted: %s", final.Verdict)
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&file, "file", "", "path to the source file (required)")
+	cmd.Flags().StringVar(&lang, "lang", "python", "language name or compiler slug")
+	cmd.MarkFlagRequired("file")
+	return cmd
+}
+
+func printVerdict(s *coderun.Submission) {
+	fmt.Printf("\nVerdict: %s\n", s.Verdict)
+	fmt.Printf("Time:    %d ms (limit %d ms)\n", s.MaxTimeMillis, s.TimeLimitMillis)
+	fmt.Printf("Memory:  %d bytes (limit %d bytes)\n", s.MaxMemoryBytes, s.MemoryLimitBytes)
+
+	if s.CompileLog != "" {
+		fmt.Printf("\nCompile log:\n%s\n", s.CompileLog)
+	}
+	if coderun.IsAccepted(s.Verdict) {
+		return
+	}
+	if s.FirstFailedTest > 0 {
+		fmt.Printf("\nFirst failed test: %d (of %d sample + %d hidden)\n",
+			s.FirstFailedTest, len(s.OpenTests), s.HiddenTestCount)
+	}
+	for _, t := range s.OpenTests {
+		if coderun.IsAccepted(t.Verdict) || t.Input == "" {
+			continue
+		}
+		fmt.Printf("\nTest %d — %s\nInput:\n%s\nExpected:\n%s\nActual:\n%s\n",
+			t.Number, t.Verdict, t.Input, t.Answer, t.Output)
+	}
+}
