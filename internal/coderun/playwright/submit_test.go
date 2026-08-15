@@ -3,6 +3,7 @@ package pwclient
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateSourceAcceptsNormalFile(t *testing.T) {
@@ -65,5 +66,47 @@ func TestParseSubmitResponseRejectsMissingGlobalID(t *testing.T) {
 	body := []byte(`{"result":{"id":1,"status":"PENDING"},"error":null}`)
 	if _, _, err := ParseSubmitResponse(body); err == nil {
 		t.Fatal("expected an error when globalId is absent")
+	}
+}
+
+func TestParseLatestSubmissionAcceptsNewerThanClick(t *testing.T) {
+	clickTime := time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC)
+	body := []byte(`{"result":{"latestSubmission":{
+		"globalId":"g-new","submitAt":"2026-08-14T16:00:01Z"}}}`)
+
+	globalID, ok := parseLatestSubmission(body, clickTime)
+	if !ok {
+		t.Fatal("a submission submitted after the click must be accepted")
+	}
+	if globalID != "g-new" {
+		t.Errorf("globalID = %q, want g-new", globalID)
+	}
+}
+
+func TestParseLatestSubmissionRejectsOlderThanClick(t *testing.T) {
+	// The endpoint returns *a* latest submission, not necessarily ours. One
+	// that predates our click belongs to an earlier attempt and must never be
+	// mistaken for the one we just made.
+	clickTime := time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC)
+	body := []byte(`{"result":{"latestSubmission":{
+		"globalId":"g-old","submitAt":"2026-08-14T15:59:59Z"}}}`)
+
+	if _, ok := parseLatestSubmission(body, clickTime); ok {
+		t.Error("a submission submitted before the click must be rejected")
+	}
+}
+
+func TestParseLatestSubmissionRejectsAbsent(t *testing.T) {
+	clickTime := time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC)
+
+	for _, body := range [][]byte{
+		[]byte(`{"result":{"latestSubmission":null}}`),
+		[]byte(`{"result":null}`),
+		[]byte(`{}`),
+		[]byte(`not json`),
+	} {
+		if _, ok := parseLatestSubmission(body, clickTime); ok {
+			t.Errorf("body %s: expected ok=false when latestSubmission is absent", body)
+		}
 	}
 }

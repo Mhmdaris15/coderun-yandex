@@ -254,6 +254,77 @@ func (s *Store) NextAttempt(ctx context.Context, selectionSlug, problemSlug stri
 	return next, nil
 }
 
+// SaveSubmission upserts one submission row, keyed by global_id. Re-running
+// the same submission (e.g. re-recording after a verdict finishes) is safe.
+func (s *Store) SaveSubmission(ctx context.Context, sub *coderun.Submission, attempt int) error {
+	accepted := 0
+	if coderun.IsAccepted(sub.Verdict) {
+		accepted = 1
+	}
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO submissions (global_id, selection_slug, problem_slug, attempt,
+                                  compiler_slug, status, verdict, accepted,
+                                  max_time_ms, max_memory_bytes, first_failed_test,
+                                  compile_log, submitted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(global_id) DO UPDATE SET
+            selection_slug = excluded.selection_slug,
+            problem_slug = excluded.problem_slug,
+            attempt = excluded.attempt,
+            compiler_slug = excluded.compiler_slug,
+            status = excluded.status,
+            verdict = excluded.verdict,
+            accepted = excluded.accepted,
+            max_time_ms = excluded.max_time_ms,
+            max_memory_bytes = excluded.max_memory_bytes,
+            first_failed_test = excluded.first_failed_test,
+            compile_log = excluded.compile_log,
+            submitted_at = excluded.submitted_at`,
+		sub.GlobalID, sub.Ref.SelectionSlug, sub.Ref.ProblemSlug, attempt,
+		sub.CompilerSlug, sub.Status, sub.Verdict, accepted,
+		sub.MaxTimeMillis, sub.MaxMemoryBytes, sub.FirstFailedTest,
+		sub.CompileLog, sub.SubmittedAt)
+	if err != nil {
+		return fmt.Errorf("save submission %s: %w", sub.GlobalID, err)
+	}
+	return nil
+}
+
+// SaveTestResults replaces the stored per-test rows for a submission: existing
+// rows for global_id are cleared first so re-saving never duplicates a test.
+func (s *Store) SaveTestResults(ctx context.Context, globalID string, tests []coderun.TestResult) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM test_results WHERE global_id = ?`, globalID); err != nil {
+		return fmt.Errorf("clear test results for %s: %w", globalID, err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+        INSERT INTO test_results (global_id, test_number, verdict, is_sample,
+                                   time_ms, memory_bytes, input, output, answer)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, t := range tests {
+		isSample := 0
+		if t.IsSample {
+			isSample = 1
+		}
+		if _, err := stmt.ExecContext(ctx, globalID, t.Number, t.Verdict, isSample,
+			t.TimeMillis, t.MemoryBytes, t.Input, t.Output, t.Answer); err != nil {
+			return fmt.Errorf("save test %d for %s: %w", t.Number, globalID, err)
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Counts(ctx context.Context) (map[coderun.Status]int, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM problems GROUP BY status`)
 	if err != nil {

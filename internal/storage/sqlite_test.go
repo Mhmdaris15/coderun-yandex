@@ -135,6 +135,129 @@ func TestNextAttemptIncrements(t *testing.T) {
 	}
 }
 
+func TestSaveSubmissionRoundTripsAcceptedFlag(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	ref := coderun.ProblemRef{SelectionSlug: "sel", ProblemSlug: "p1"}
+
+	cases := []struct {
+		globalID string
+		verdict  string
+		accepted bool
+	}{
+		{"g-ok", "OK", true},
+		{"g-wa", "WRONG_ANSWER", false},
+	}
+	for _, c := range cases {
+		sub := &coderun.Submission{
+			GlobalID:        c.globalID,
+			Ref:             ref,
+			CompilerSlug:    "python_make",
+			Status:          "FINISHED",
+			Verdict:         c.verdict,
+			MaxTimeMillis:   42,
+			MaxMemoryBytes:  1024,
+			FirstFailedTest: 3,
+			CompileLog:      "",
+		}
+		if err := s.SaveSubmission(ctx, sub, 1); err != nil {
+			t.Fatalf("SaveSubmission(%s): %v", c.globalID, err)
+		}
+	}
+
+	var gotVerdict string
+	var gotAccepted int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT verdict, accepted FROM submissions WHERE global_id = ?`, "g-ok").
+		Scan(&gotVerdict, &gotAccepted); err != nil {
+		t.Fatal(err)
+	}
+	if gotVerdict != "OK" || gotAccepted != 1 {
+		t.Errorf("accepted submission: verdict=%q accepted=%d, want OK/1", gotVerdict, gotAccepted)
+	}
+
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT verdict, accepted FROM submissions WHERE global_id = ?`, "g-wa").
+		Scan(&gotVerdict, &gotAccepted); err != nil {
+		t.Fatal(err)
+	}
+	if gotVerdict != "WRONG_ANSWER" || gotAccepted != 0 {
+		t.Errorf("rejected submission: verdict=%q accepted=%d, want WRONG_ANSWER/0", gotVerdict, gotAccepted)
+	}
+}
+
+func TestSaveSubmissionUpsertIsSafeToRerun(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	ref := coderun.ProblemRef{SelectionSlug: "sel", ProblemSlug: "p1"}
+
+	sub := &coderun.Submission{GlobalID: "g1", Ref: ref, Status: "PENDING", Verdict: ""}
+	if err := s.SaveSubmission(ctx, sub, 1); err != nil {
+		t.Fatal(err)
+	}
+	sub.Status = "FINISHED"
+	sub.Verdict = "OK"
+	if err := s.SaveSubmission(ctx, sub, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM submissions WHERE global_id = ?`, "g1").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("got %d rows for g1, want 1 (re-saving must upsert, not duplicate)", count)
+	}
+
+	var verdict string
+	if err := s.db.QueryRowContext(ctx, `SELECT verdict FROM submissions WHERE global_id = ?`, "g1").Scan(&verdict); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "OK" {
+		t.Errorf("verdict = %q, want OK (the second save should have updated the row)", verdict)
+	}
+}
+
+func TestSaveTestResultsReplacesRatherThanDuplicates(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	tests1 := []coderun.TestResult{
+		{Number: 1, Verdict: "WRONG_ANSWER", IsSample: true, TimeMillis: 10, MemoryBytes: 100, Input: "in1", Output: "out1", Answer: "ans1"},
+		{Number: 2, Verdict: "OK", IsSample: true, TimeMillis: 5, MemoryBytes: 50},
+	}
+	if err := s.SaveTestResults(ctx, "g1", tests1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-save with a different, smaller set: the old rows must be gone, not
+	// merely appended to.
+	tests2 := []coderun.TestResult{
+		{Number: 1, Verdict: "OK", IsSample: true, TimeMillis: 12, MemoryBytes: 110, Input: "in1b"},
+	}
+	if err := s.SaveTestResults(ctx, "g1", tests2); err != nil {
+		t.Fatal(err)
+	}
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM test_results WHERE global_id = ?`, "g1").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("got %d test rows for g1 after re-save, want 1 (replace, not accumulate)", count)
+	}
+
+	var verdict, input string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT verdict, input FROM test_results WHERE global_id = ? AND test_number = 1`, "g1").
+		Scan(&verdict, &input); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "OK" || input != "in1b" {
+		t.Errorf("test 1 = (%q, %q), want (OK, in1b) from the second save", verdict, input)
+	}
+}
+
 func TestOpenCreatesParentDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "deep", "x.db")
 	s, err := Open(path)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -58,28 +59,58 @@ func submitCmd() *cobra.Command {
 
 				fmt.Printf("[2/4] Submitting %s as %s...\n", file, slug)
 				sub, err := b.Submit(ctx, ref, slug, file)
-				if err != nil {
+				unconfirmed := errors.Is(err, pwclient.ErrSubmitUnconfirmed)
+				if err != nil && !unconfirmed {
+					// Nothing was confirmed submitted and there is nothing to
+					// recover: no attempt to reserve, nothing to record.
 					return err
 				}
-				fmt.Printf("      submission %s\n", sub.GlobalID)
-
-				// The submission now exists on CodeRun's servers. Every exit
-				// path from here must leave the user able to find it again.
-				attempt, err := st.NextAttempt(ctx, ref.SelectionSlug, ref.ProblemSlug)
-				if err != nil {
-					// No attempt number means no artifact filename. The globalId
-					// goes into the error text, because it is the only handle
-					// that can recover this submission.
-					return fmt.Errorf("submission %s was accepted by CodeRun but no attempt number could be reserved: %w",
-						sub.GlobalID, err)
+				if unconfirmed {
+					fmt.Println("      submission not confirmed by the server")
+				} else {
+					fmt.Printf("      submission %s\n", sub.GlobalID)
 				}
 
-				record := func(verdict string) error {
-					return storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
+				// A submission may now exist on CodeRun's servers — confirmed,
+				// or not. Every exit path from here must leave the user able to
+				// find it again.
+				attempt, attemptErr := st.NextAttempt(ctx, ref.SelectionSlug, ref.ProblemSlug)
+				if attemptErr != nil {
+					// No attempt number means no artifact filename. The globalId
+					// (if any) goes into the error text, because it is the only
+					// handle that can recover this submission.
+					return fmt.Errorf("submission %s was sent to CodeRun but no attempt number could be reserved: %w",
+						sub.GlobalID, attemptErr)
+				}
+
+				// record persists everything known about sub so far — the
+				// write-only artifact sidecar for humans, and the submission
+				// (plus any judged tests) in SQLite, which is what the program
+				// itself ever reads back.
+				record := func(verdict string, tests []coderun.TestResult) error {
+					if werr := storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
 						Language:     slug,
 						SubmissionID: sub.GlobalID,
 						Verdict:      verdict,
-					})
+					}); werr != nil {
+						return werr
+					}
+					if serr := st.SaveSubmission(ctx, sub, attempt); serr != nil {
+						return serr
+					}
+					if len(tests) > 0 {
+						if terr := st.SaveTestResults(ctx, sub.GlobalID, tests); terr != nil {
+							return terr
+						}
+					}
+					return nil
+				}
+
+				if unconfirmed {
+					if rerr := record("UNCONFIRMED", nil); rerr != nil {
+						return fmt.Errorf("submission may exist but is unconfirmed, and recording the attempt also failed: %v (original: %w)", rerr, err)
+					}
+					return fmt.Errorf("submission was not confirmed by the server; a submission may exist on CodeRun — check the site: %w", err)
 				}
 
 				fmt.Println("[3/4] Waiting for the verdict...")
@@ -88,16 +119,17 @@ func submitCmd() *cobra.Command {
 					// Record what we know before surfacing the failure. The
 					// globalId is the only handle that can recover this
 					// submission later.
-					if err := record("UNKNOWN"); err != nil {
+					if err := record("UNKNOWN", nil); err != nil {
 						return fmt.Errorf("could not read the verdict (%v), and recording the attempt also failed: %w", verdictErr, err)
 					}
 					return fmt.Errorf("submission %s saved as attempt %d, but the verdict could not be read: %w",
 						sub.GlobalID, attempt, verdictErr)
 				}
 				final.Ref = ref
+				sub = final // record() below persists the fully judged submission
 
 				fmt.Println("[4/4] Recording the attempt...")
-				if err := record(final.Verdict); err != nil {
+				if err := record(final.Verdict, final.OpenTests); err != nil {
 					return err
 				}
 

@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/mxschmitt/playwright-go"
 )
 
 // loginMarker is the control CodeRun renders only for anonymous visitors.
@@ -29,7 +31,13 @@ func IsLoggedIn(html string) bool {
 
 // AuthStatus loads a cheap CodeRun page and reports session validity.
 func (b *Browser) AuthStatus(ctx context.Context) (bool, error) {
-	html, err := b.Goto(ctx, "/selections?group=coderun-seasons")
+	return b.authStatusOn(ctx, b.Page)
+}
+
+// authStatusOn is AuthStatus parameterised over the page to check, so
+// AwaitLogin can poll on a page other than the one the operator is using.
+func (b *Browser) authStatusOn(ctx context.Context, page playwright.Page) (bool, error) {
+	html, err := b.gotoOn(ctx, page, "/selections?group=coderun-seasons")
 	if err != nil {
 		// A challenge here means "not authenticated", which is an answer
 		// rather than a failure.
@@ -63,6 +71,15 @@ func (b *Browser) AwaitLogin(ctx context.Context, timeout time.Duration) error {
 	fmt.Println("Complete any 2FA or CAPTCHA yourself — this program will not touch them.")
 	fmt.Println("Waiting for the session to become active...")
 
+	// Poll on a separate page. Polling on b.Page — the same page the operator
+	// is typing their credentials into — would navigate their login form out
+	// from under them every interval.
+	pollPage, err := b.Ctx.NewPage()
+	if err != nil {
+		return fmt.Errorf("open polling page: %w", err)
+	}
+	defer pollPage.Close()
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -71,7 +88,7 @@ func (b *Browser) AwaitLogin(ctx context.Context, timeout time.Duration) error {
 		case <-time.After(2 * time.Second):
 		}
 
-		ok, err := b.AuthStatus(ctx)
+		ok, err := b.authStatusOn(ctx, pollPage)
 		if err != nil {
 			slog.Debug("waiting for login", "error", err)
 			continue

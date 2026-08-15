@@ -86,6 +86,15 @@ func (b *Browser) Close() error {
 // the configured request delay before navigating and checks for challenges
 // after, so every caller inherits both behaviours.
 func (b *Browser) Goto(ctx context.Context, path string) (string, error) {
+	return b.gotoOn(ctx, b.Page, path)
+}
+
+// gotoOn is Goto parameterised over the page to navigate. It exists so a
+// caller that must not disturb the main page — AwaitLogin's polling, in
+// particular, which must never navigate the operator's login form out from
+// under them — can drive a separate page through the same delay and
+// challenge-detection behaviour.
+func (b *Browser) gotoOn(ctx context.Context, page playwright.Page, path string) (string, error) {
 	select {
 	case <-ctx.Done():
 		return "", ctx.Err()
@@ -95,17 +104,17 @@ func (b *Browser) Goto(ctx context.Context, path string) (string, error) {
 	url := config.BaseURL + path
 	slog.Debug("navigating", "path", path)
 
-	if _, err := b.Page.Goto(url, playwright.PageGotoOptions{
+	if _, err := page.Goto(url, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 	}); err != nil {
 		return "", fmt.Errorf("navigate to %s: %w", path, err)
 	}
 
-	html, err := b.Page.Content()
+	html, err := page.Content()
 	if err != nil {
 		return "", fmt.Errorf("read page content: %w", err)
 	}
-	if err := DetectChallenge(b.Page.URL(), html); err != nil {
+	if err := DetectChallenge(page.URL(), html); err != nil {
 		return "", err
 	}
 	return html, nil
