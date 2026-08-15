@@ -212,3 +212,9 @@ func (b *Browser) apiGet(ctx context.Context, path string) ([]byte, error) {
 	}
 	return resp.Body()
 }
+
+// ProblemRefFor is a small constructor used by tests and callers that only
+// have the two slugs.
+func ProblemRefFor(selectionSlug, problemSlug string) coderun.ProblemRef {
+	return coderun.ProblemRef{SelectionSlug: selectionSlug, ProblemSlug: problemSlug}
+}
