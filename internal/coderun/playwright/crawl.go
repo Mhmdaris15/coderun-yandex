@@ -72,11 +72,21 @@ func (b *Browser) ListProblems(ctx context.Context, selectionSlug string) ([]cod
 	for page <= totalPages {
 		path := fmt.Sprintf("/selections/%s", selectionSlug)
 		if page > 1 {
-			filters, err := extract.EncodeFilters(extract.DefaultFilters(page))
-			if err != nil {
-				return nil, err
-			}
-			path += "?filters=" + filters
+			// The ?filters= double-encoded JSON blob is what problem-detail
+			// links carry to restore list state, but it is NOT what the
+			// site's own pager uses to turn pages: the pager's rendered
+			// anchors carry plain currentPage/pageSize/search query params
+			// (e.g. "?currentPage=2&pageSize=20&search="), and only that
+			// form actually changes the server-rendered rows — confirmed
+			// live against the 2025-summer-common selection, see
+			// TestIntegrationListProblemsPaginates. Sending ?filters= here
+			// was silently ignored, which is why every page repeated page 1.
+			f := extract.DefaultFilters(page)
+			q := url.Values{}
+			q.Set("currentPage", strconv.Itoa(f.CurrentPage))
+			q.Set("pageSize", strconv.Itoa(f.PageSize))
+			q.Set("search", f.Search)
+			path += "?" + q.Encode()
 		}
 
 		html, err := b.Goto(ctx, path)
@@ -114,7 +124,7 @@ func (b *Browser) ListProblems(ctx context.Context, selectionSlug string) ([]cod
 		// If a page contributes nothing new, pagination is not working and
 		// looping further would spin against the site.
 		if page > 1 && added == 0 {
-			return nil, fmt.Errorf("page %d returned no new problems: the ?filters= encoding may have drifted", page)
+			return nil, fmt.Errorf("page %d returned no new problems: the pagination query params may have drifted", page)
 		}
 		page++
 	}
