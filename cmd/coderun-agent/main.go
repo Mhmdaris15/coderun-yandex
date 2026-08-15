@@ -95,10 +95,29 @@ func resolveCompiler(name string, compilers []coderun.Compiler) (string, error) 
 			return c.Slug, nil
 		}
 	}
-	// Last resort: a prefix match, so "c++" finds "C++ 14.1.0".
-	for _, c := range compilers {
-		if strings.HasPrefix(strings.ToLower(c.Title), want) && want != "" {
-			return c.Slug, nil
+	// Last resort: a prefix match, so "pyth" finds "Python".
+	//
+	// An ambiguous prefix is an error, never a silent pick. "jav" prefixes both
+	// Java and JavaScript, and quietly choosing whichever the site happened to
+	// list first would submit the wrong language — which still counts as a real
+	// submission against the user's record.
+	if want != "" {
+		var matches []coderun.Compiler
+		for _, c := range compilers {
+			if strings.HasPrefix(strings.ToLower(c.Title), want) {
+				matches = append(matches, c)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0].Slug, nil
+		}
+		if len(matches) > 1 {
+			var names []string
+			for _, c := range matches {
+				names = append(names, fmt.Sprintf("%s (%s)", c.Slug, c.Title))
+			}
+			return "", fmt.Errorf("language %q is ambiguous; did you mean one of: %s",
+				name, strings.Join(names, ", "))
 		}
 	}
 

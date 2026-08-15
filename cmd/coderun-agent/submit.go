@@ -57,24 +57,41 @@ func submitCmd() *cobra.Command {
 					return err
 				}
 
-				fmt.Println("[3/4] Waiting for the verdict...")
-				final, err := b.AwaitVerdict(ctx, sub.GlobalID, cfg.PollInterval, cfg.SubmissionTimeout)
-				if err != nil {
-					return err
-				}
-				final.Ref = ref
-
-				fmt.Println("[4/4] Recording the attempt...")
+				// From here the submission exists on CodeRun's servers and the
+				// attempt number is durably spent. Every exit path below must
+				// therefore record the attempt, or the submission becomes
+				// unfindable from local state while still counting against the
+				// user's record.
 				source, err := readFile(file)
 				if err != nil {
 					return err
 				}
 				ext := strings.TrimPrefix(filepath.Ext(file), ".")
-				if err := storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
-					Language:     slug,
-					SubmissionID: final.GlobalID,
-					Verdict:      final.Verdict,
-				}); err != nil {
+
+				record := func(verdict string) error {
+					return storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
+						Language:     slug,
+						SubmissionID: sub.GlobalID,
+						Verdict:      verdict,
+					})
+				}
+
+				fmt.Println("[3/4] Waiting for the verdict...")
+				final, verdictErr := b.AwaitVerdict(ctx, sub.GlobalID, cfg.PollInterval, cfg.SubmissionTimeout)
+				if verdictErr != nil {
+					// Record what we know before surfacing the failure. The
+					// globalId is the only handle that can recover this
+					// submission later.
+					if err := record("UNKNOWN"); err != nil {
+						return fmt.Errorf("could not read the verdict (%v), and recording the attempt also failed: %w", verdictErr, err)
+					}
+					return fmt.Errorf("submission %s saved as attempt %d, but the verdict could not be read: %w",
+						sub.GlobalID, attempt, verdictErr)
+				}
+				final.Ref = ref
+
+				fmt.Println("[4/4] Recording the attempt...")
+				if err := record(final.Verdict); err != nil {
 					return err
 				}
 
