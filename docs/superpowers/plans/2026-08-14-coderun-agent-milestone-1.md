@@ -4214,6 +4214,43 @@ func TestResolveCompilerJavaScriptMapsToNodeSlug(t *testing.T) {
 	}
 }
 
+func TestResolveCompilerRejectsAmbiguousPrefix(t *testing.T) {
+	// "jav" prefixes both Java and JavaScript. Returning the first match would
+	// submit Java source as JavaScript or vice versa — a wasted submission on
+	// a live contest platform, with nothing in the output to say a fuzzy match
+	// occurred.
+	ambiguous := []coderun.Compiler{
+		{Slug: "java_make", Title: "Java"},
+		{Slug: "nodejs_20_make", Title: "JavaScript"},
+	}
+	_, err := resolveCompiler("jav", ambiguous)
+	if err == nil {
+		t.Fatal("expected an error for an ambiguous prefix, not a silent pick")
+	}
+	for _, want := range []string{"java_make", "nodejs_20_make"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should list candidate %q", err, want)
+		}
+	}
+}
+
+func TestResolveCompilerExactTitleBeatsPrefix(t *testing.T) {
+	// "C" is an exact title and also a prefix of "C#" and "C++". The exact
+	// match must win, or asking for C would be reported as ambiguous.
+	cLike := []coderun.Compiler{
+		{Slug: "c_make", Title: "C"},
+		{Slug: "csharp_make", Title: "C#"},
+		{Slug: "cpp_make", Title: "C++"},
+	}
+	got, err := resolveCompiler("c", cLike)
+	if err != nil {
+		t.Fatalf("exact title match should win over prefix ambiguity: %v", err)
+	}
+	if got != "c_make" {
+		t.Errorf("got %q, want c_make", got)
+	}
+}
+
 func TestResolveCompilerUnknownListsOptions(t *testing.T) {
 	_, err := resolveCompiler("brainfuck", testCompilers)
 	if err == nil {
@@ -4333,10 +4370,29 @@ func resolveCompiler(name string, compilers []coderun.Compiler) (string, error) 
 			return c.Slug, nil
 		}
 	}
-	// Last resort: a prefix match, so "c++" finds "C++ 14.1.0".
-	for _, c := range compilers {
-		if strings.HasPrefix(strings.ToLower(c.Title), want) && want != "" {
-			return c.Slug, nil
+	// Last resort: a prefix match, so "pyth" finds "Python".
+	//
+	// An ambiguous prefix is an error, never a silent pick. "jav" prefixes both
+	// Java and JavaScript, and quietly choosing whichever the site happened to
+	// list first would submit the wrong language — which still counts as a real
+	// submission against the user's record.
+	if want != "" {
+		var matches []coderun.Compiler
+		for _, c := range compilers {
+			if strings.HasPrefix(strings.ToLower(c.Title), want) {
+				matches = append(matches, c)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0].Slug, nil
+		}
+		if len(matches) > 1 {
+			var names []string
+			for _, c := range matches {
+				names = append(names, fmt.Sprintf("%s (%s)", c.Slug, c.Title))
+			}
+			return "", fmt.Errorf("language %q is ambiguous; did you mean one of: %s",
+				name, strings.Join(names, ", "))
 		}
 	}
 
@@ -4584,24 +4640,41 @@ func submitCmd() *cobra.Command {
 					return err
 				}
 
-				fmt.Println("[3/4] Waiting for the verdict...")
-				final, err := b.AwaitVerdict(ctx, sub.GlobalID, cfg.PollInterval, cfg.SubmissionTimeout)
-				if err != nil {
-					return err
-				}
-				final.Ref = ref
-
-				fmt.Println("[4/4] Recording the attempt...")
+				// From here the submission exists on CodeRun's servers and the
+				// attempt number is durably spent. Every exit path below must
+				// therefore record the attempt, or the submission becomes
+				// unfindable from local state while still counting against the
+				// user's record.
 				source, err := readFile(file)
 				if err != nil {
 					return err
 				}
 				ext := strings.TrimPrefix(filepath.Ext(file), ".")
-				if err := storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
-					Language:     slug,
-					SubmissionID: final.GlobalID,
-					Verdict:      final.Verdict,
-				}); err != nil {
+
+				record := func(verdict string) error {
+					return storage.WriteAttempt("solutions", ref, attempt, ext, source, storage.AttemptMeta{
+						Language:     slug,
+						SubmissionID: sub.GlobalID,
+						Verdict:      verdict,
+					})
+				}
+
+				fmt.Println("[3/4] Waiting for the verdict...")
+				final, verdictErr := b.AwaitVerdict(ctx, sub.GlobalID, cfg.PollInterval, cfg.SubmissionTimeout)
+				if verdictErr != nil {
+					// Record what we know before surfacing the failure. The
+					// globalId is the only handle that can recover this
+					// submission later.
+					if err := record("UNKNOWN"); err != nil {
+						return fmt.Errorf("could not read the verdict (%v), and recording the attempt also failed: %w", verdictErr, err)
+					}
+					return fmt.Errorf("submission %s saved as attempt %d, but the verdict could not be read: %w",
+						sub.GlobalID, attempt, verdictErr)
+				}
+				final.Ref = ref
+
+				fmt.Println("[4/4] Recording the attempt...")
+				if err := record(final.Verdict); err != nil {
 					return err
 				}
 
